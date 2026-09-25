@@ -320,23 +320,11 @@ void createFtFunc(Module &Md, StringRef name) {
   if (FnValue == nullptr) { // the function does not exist and has not even been declared
     FnValue = Md.getOrInsertFunction(name, FunctionType::getVoidTy(Md.getContext())).getCallee();
     assert(isa<Function>(FnValue) && "The function name must correspond to a function.");
-  
     Fn = cast<Function>(FnValue);
-  
-    if (Fn->isDeclaration()) {
-      BasicBlock *StartBB = BasicBlock::Create(Md.getContext(), "start", Fn);
-      BasicBlock *LoopBB = BasicBlock::Create(Md.getContext(), "loop", Fn);
-  
-      IRBuilder<> B(StartBB);
-      B.CreateBr(LoopBB);
-  
-      B.SetInsertPoint(LoopBB);
-      B.CreateBr(LoopBB);
-    }
   } else {
     Fn = cast<Function>(FnValue);
   }
-  
+
   Fn->addFnAttr(Attribute::NoInline);
 }
 
@@ -378,6 +366,7 @@ void createProfilingFunc(Module &Md, StringRef name, ProfilingType PT) {
 
   // create the body
   if (Fn->isDeclaration()) {
+    Fn->setLinkage(GlobalValue::WeakAnyLinkage);
     BasicBlock *StartBB = BasicBlock::Create(Md.getContext(), "start", Fn);
     IRBuilder<> B(StartBB);
     Value *RetVal;

@@ -8,8 +8,8 @@
  * ************************************************************************************************
  */
 #include "ASPIS.h"
-#include "llvm/Demangle/Demangle.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -22,7 +22,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include <regex>
 #include <array>
 #include <fstream>
 #include <iostream>
@@ -36,6 +35,7 @@
 #include <llvm/Support/ModRef.h>
 #include <map>
 #include <queue>
+#include <regex>
 #include <unordered_set>
 
 #include "Utils/Utils.h"
@@ -65,489 +65,521 @@ static int globalVarCounter = 0;
 /**
  * @brief Check if the passed store is the one which saves the vtable in the object.
  * In case it is, return the pointer to the GV of the vtable.
- * 
+ *
  * @param SInst Reference to the store instruction to analyze.
  * @return The pointer to the vtable global variable, if found; nullptr otherwise.
  */
-GlobalVariable* isVTableStore(StoreInst &SInst) {
-  if(isa<GetElementPtrInst>(SInst.getValueOperand())) {
-    // TODO: Should see the uses of the valueOperand to find this inst in case it happens
-    auto *V = cast<GetElementPtrInst>(SInst.getValueOperand())->getOperand(0);
-    if(isa<GlobalVariable>(V)) {
-      auto *GV = cast<GlobalVariable>(V);
-      auto vtableName = demangle(GV->getName().str());
-      // Found "vtable" in name
-      if(vtableName.find("vtable") != vtableName.npos) {
-        return GV;
-      }
+GlobalVariable *isVTableStore(StoreInst &SInst) {
+    if (isa<GetElementPtrInst>(SInst.getValueOperand())) {
+        // TODO: Should see the uses of the valueOperand to find this inst in case it happens
+        auto *V = cast<GetElementPtrInst>(SInst.getValueOperand())->getOperand(0);
+        if (isa<GlobalVariable>(V)) {
+            auto *GV = cast<GlobalVariable>(V);
+            auto vtableName = demangle(GV->getName().str());
+            // Found "vtable" in name
+            if (vtableName.find("vtable") != vtableName.npos) {
+                return GV;
+            }
+        }
+    } else if (isa<ConstantExpr>(SInst.getValueOperand())) {
+        auto *CE = cast<ConstantExpr>(SInst.getValueOperand());
+        if (CE->getOpcode() == Instruction::GetElementPtr &&
+            isa<GlobalVariable>(CE->getOperand(0))) {
+            auto *GV = cast<GlobalVariable>(CE->getOperand(0));
+            auto vtableName = demangle(GV->getName().str());
+            // Found "vtable" in name
+            if (vtableName.find("vtable") != vtableName.npos) {
+                return GV;
+            }
+        }
     }
-  } else if(isa<ConstantExpr>(SInst.getValueOperand())) {
-    auto *CE = cast<ConstantExpr>(SInst.getValueOperand());
-    if(CE->getOpcode() == Instruction::GetElementPtr && isa<GlobalVariable>(CE->getOperand(0))) {
-      auto *GV = cast<GlobalVariable>(CE->getOperand(0));
-      auto vtableName = demangle(GV->getName().str());
-      // Found "vtable" in name
-      if(vtableName.find("vtable") != vtableName.npos) {
-        return GV;
-      }
-    }
-  }
-  
-  return nullptr;
+
+    return nullptr;
 }
 
 /**
- * @brief Retrieve all the virtual methods present in the vtable from the pointer to the constructor.
- * 
+ * @brief Retrieve all the virtual methods present in the vtable from the pointer to the
+ * constructor.
+ *
  * @param Fn pointer to a function.
  * @return A set containing the virtual functions referenced in the vtable (could be empty).
  */
 std::set<Function *> EDDI::getVirtualMethodsFromConstructor(Function *Fn) {
-  std::set<Function *> virtualMethods;
+    std::set<Function *> virtualMethods;
 
-  if(!Fn) {
-    errs() << "Error: Fn is not a valid function.\n";
-    return virtualMethods;
-  }
-
-  // Find vtable
-  GlobalVariable *vtable = nullptr;
-  for(auto &BB : *Fn) {
-    for(auto &I : BB) {
-      if(isa<StoreInst>(I)){
-        auto &SInst = cast<StoreInst>(I);
-        vtable = isVTableStore(SInst);
-      }
-
-      if(vtable)
-        break;
+    if (!Fn) {
+        errs() << "Error: Fn is not a valid function.\n";
+        return virtualMethods;
     }
 
-    if(vtable)
-      break;
-  }
-  
-  // Get all the virtual methods
-  if(vtable) {
-    // Ensure the vtable global variable has an initializer
-    if(!vtable->hasInitializer()) {
-      errs() << "Error: Vtable does not have an initializer.\n";
-      return virtualMethods;
-    }
+    // Find vtable
+    GlobalVariable *vtable = nullptr;
+    for (auto &BB : *Fn) {
+        for (auto &I : BB) {
+            if (isa<StoreInst>(I)) {
+                auto &SInst = cast<StoreInst>(I);
+                vtable = isVTableStore(SInst);
+            }
 
-    Constant *Initializer = vtable->getInitializer();
-    if (!Initializer || !isa<ConstantStruct>(Initializer)) {
-      errs() << "Error: Vtable initializer is not a ConstantStruct.\n";
-      return virtualMethods;
-    }
-
-    // Extract the array field from the struct
-    ConstantStruct *VTableStruct = cast<ConstantStruct>(Initializer);
-
-    for(int i = 0; i < VTableStruct->getNumOperands(); i++) {
-      Constant *ArrayField = VTableStruct->getOperand(i);
-      if (!isa<ConstantArray>(ArrayField)) {
-        errs() << "Error: Vtable field " << i << " is not a ConstantArray.\n";
-        continue;
-      }
-
-      // get virtual functions to harden from vtable
-      for (Value *Elem : cast<ConstantArray>(ArrayField)->operands()) {
-        if (isa<Function>(Elem)) {
-          virtualMethods.insert(cast<Function>(Elem));
+            if (vtable)
+                break;
         }
-      }
-    }
-  }
 
-  return virtualMethods;
+        if (vtable)
+            break;
+    }
+
+    // Get all the virtual methods
+    if (vtable) {
+        // Ensure the vtable global variable has an initializer
+        if (!vtable->hasInitializer()) {
+            errs() << "Error: Vtable does not have an initializer.\n";
+            return virtualMethods;
+        }
+
+        Constant *Initializer = vtable->getInitializer();
+        if (!Initializer || !isa<ConstantStruct>(Initializer)) {
+            errs() << "Error: Vtable initializer is not a ConstantStruct.\n";
+            return virtualMethods;
+        }
+
+        // Extract the array field from the struct
+        ConstantStruct *VTableStruct = cast<ConstantStruct>(Initializer);
+
+        for (int i = 0; i < VTableStruct->getNumOperands(); i++) {
+            Constant *ArrayField = VTableStruct->getOperand(i);
+            if (!isa<ConstantArray>(ArrayField)) {
+                errs() << "Error: Vtable field " << i << " is not a ConstantArray.\n";
+                continue;
+            }
+
+            // get virtual functions to harden from vtable
+            for (Value *Elem : cast<ConstantArray>(ArrayField)->operands()) {
+                if (isa<Function>(Elem)) {
+                    virtualMethods.insert(cast<Function>(Elem));
+                }
+            }
+        }
+    }
+
+    return virtualMethods;
 }
 
 /**
- * @brief For each toHardenConstructors, modifies the store for the vtable so that is used 
+ * @brief For each toHardenConstructors, modifies the store for the vtable so that is used
  * the `_dup` version of that vtable.
- * 
- * identifies the store which saves the vtable in the object (if exists). Found it, 
- * duplicates the vtable (uses all the virtual `_dup` methods) and uses this new vtable 
+ *
+ * identifies the store which saves the vtable in the object (if exists). Found it,
+ * duplicates the vtable (uses all the virtual `_dup` methods) and uses this new vtable
  * (global variable) in the store.
- * 
+ *
  * @param Md The module we are analyzing.
  */
 void EDDI::fixDuplicatedConstructors(Module &Md) {
-  for(Function *Fn : toHardenConstructors) {
-    GlobalVariable *vtable = nullptr;
-    GlobalVariable *NewVtable = nullptr;
-    StoreInst *SInstVtable = nullptr;
-    Function *FnDup = getFunctionDuplicate(Fn);
+    for (Function *Fn : toHardenConstructors) {
+        GlobalVariable *vtable = nullptr;
+        GlobalVariable *NewVtable = nullptr;
+        StoreInst *SInstVtable = nullptr;
+        Function *FnDup = getFunctionDuplicate(Fn);
 
-    if(!FnDup) {
-      errs() << "Error: Doesn't exist the dup version of " << Fn->getName() << "\n";
-      continue;
-    }
-
-    // Handle the case where the class has no attribute: zero the padding byte
-    auto zeroThisPointee = [&](Function *F) {
-      if (F->arg_empty())
-        return;
-
-      Argument *ThisArg = F->getArg(0);
-      if (!ThisArg->getType()->isPointerTy())
-        return;
-
-      BasicBlock &Entry = F->getEntryBlock();
-      IRBuilder<> B(&Entry, Entry.getFirstNonPHIOrDbgOrAlloca());
-
-      B.CreateStore(B.getInt8(0), ThisArg);
-    };
-
-    zeroThisPointee(Fn);
-    zeroThisPointee(FnDup);
-
-    // Find vtable
-    LLVM_DEBUG(dbgs() << "[REDDI] Finding vtable for " << Fn->getName() << "\n");
-    for(auto &BB : *Fn) {
-      for(auto &I : BB) {
-        if(isa<StoreInst>(I)){
-          auto &SInst = cast<StoreInst>(I);
-          vtable = isVTableStore(SInst);
-        }
-      
-        if(vtable)
-          break;
-      }
-
-      if(vtable) 
-        break;
-    }
-
-    // Duplicate vtable
-    if(vtable && vtable->hasInitializer()) {
-      // Ensure the vtable global variable has an initializer
-      Constant *Initializer = vtable->getInitializer();
-      if (!Initializer || !isa<ConstantStruct>(Initializer)) {
-        errs() << "Error: Vtable initializer is not a ConstantStruct.\n";
-        return;
-      }
-
-      // Extract the array field from the struct
-      ConstantStruct *VTableStruct = cast<ConstantStruct>(Initializer);
-
-      std::vector<Constant *> NewArrayRef;
-
-      for(int i = 0; i < VTableStruct->getNumOperands(); i++) {
-        Constant *ArrayField = VTableStruct->getOperand(i);
-        if (!isa<ConstantArray>(ArrayField)) {
-          errs() << "Error: Vtable field " << i << " is not a ConstantArray.\n";
-          continue;
+        if (!FnDup) {
+            errs() << "Error: Doesn't exist the dup version of " << Fn->getName() << "\n";
+            continue;
         }
 
-        ConstantArray *FunctionArray = cast<ConstantArray>(ArrayField);
+        // Handle the case where the class has no attribute: zero the padding byte
+        auto zeroThisPointee = [&](Function *F) {
+            if (F->arg_empty())
+                return;
 
-        // Iterate over elements of the array and modify function pointers
-        std::vector<Constant *> ModifiedElements;
-        for (Value *Elem : FunctionArray->operands()) {
-          if (isa<Function>(Elem)) {
-            Function *Func = cast<Function>(Elem);
-            // Replace with the _dup version of the function
-            std::string DupName = Func->getName().str() + "_dup";
-            Function *DupFunction = Md.getFunction(DupName);
+            Argument *ThisArg = F->getArg(0);
+            if (!ThisArg->getType()->isPointerTy())
+                return;
 
-            if (DupFunction) {
-              // LLVM_DEBUG(dbgs() << "Getting _dup function: " << DupFunction->getName() << "\n");
-              ModifiedElements.push_back(DupFunction);
-            } else {
-              errs() << "Error: Missing _dup function for: " << Func->getName() << "\n";
-              ModifiedElements.push_back(cast<Constant>(Elem)); // Keep the original
-            }
-          } else {
-            // Retain non-function elements
-            ModifiedElements.push_back(cast<Constant>(Elem));
-          }
-        }
+            BasicBlock &Entry = F->getEntryBlock();
+            IRBuilder<> B(&Entry, Entry.getFirstNonPHIOrDbgOrAlloca());
 
-        // Create a new ConstantArray with the modified elements
-        ArrayType *ArrayType = FunctionArray->getType();
-        Constant *NewArray = ConstantArray::get(ArrayType, ModifiedElements);
-        NewArrayRef.push_back(NewArray);
-      }
+            B.CreateStore(B.getInt8(0), ThisArg);
+        };
 
-      // Create a new ConstantStruct for the vtable
-      Constant *NewVTableStruct = ConstantStruct::get(VTableStruct->getType(), NewArrayRef);
+        zeroThisPointee(Fn);
+        zeroThisPointee(FnDup);
 
-      // Create a new global variable for the modified vtable
-      NewVtable = new GlobalVariable(
-        Md,
-        NewVTableStruct->getType(),
-        vtable->isConstant(),
-        GlobalValue::ExternalLinkage,
-        NewVTableStruct,
-        vtable->getName() + "_dup"
-      );
-      NewVtable->setSection(vtable->getSection());
-      LLVM_DEBUG(dbgs() << "[REDDI] Created new vtable: " << NewVtable->getName() << "\n");
-    }
-
-    // In the dup constructor, change the relative store
-    if(NewVtable) {
-      for(auto &BB : *FnDup) {
-        for(auto &I : BB) {
-          if(isa<StoreInst>(I)) {
-            auto &SInst = cast<StoreInst>(I);
-            if(isVTableStore(SInst)) {
-              if(isa<GetElementPtrInst>(SInst.getValueOperand())) {
-                // TODO: Should see the uses of the valueOperand to find this inst in case it happens
-                errs() << "Error: GEP instruction not handled\n";
-              } else if(isa<ConstantExpr>(SInst.getValueOperand())) {
-                auto *CE = cast<ConstantExpr>(SInst.getValueOperand());
-                if (CE->getOpcode() == Instruction::GetElementPtr) {
-                  // Extract the indices and base type
-                  std::vector<Constant *> Indices = {
-                                  ConstantInt::get(Type::getInt32Ty(Md.getContext()), 0),
-                                  ConstantInt::get(Type::getInt32Ty(Md.getContext()), 0),
-                                  ConstantInt::get(Type::getInt32Ty(Md.getContext()), 2)
-                                };
-
-                  // Create a new GEP ConstantExpr with the new vtable
-                  auto *NewGEP = ConstantExpr::getGetElementPtr(
-                      cast<GEPOperator>(CE)->getSourceElementType(), 
-                      NewVtable,
-                      Indices,
-                      cast<GEPOperator>(CE)->isInBounds()
-                  );
-
-                  // Update the store instruction
-                  SInst.setOperand(0, NewGEP);
+        // Find vtable
+        LLVM_DEBUG(dbgs() << "[REDDI] Finding vtable for " << Fn->getName() << "\n");
+        for (auto &BB : *Fn) {
+            for (auto &I : BB) {
+                if (isa<StoreInst>(I)) {
+                    auto &SInst = cast<StoreInst>(I);
+                    vtable = isVTableStore(SInst);
                 }
-                LLVM_DEBUG(dbgs() << "[REDDI] Changed vtable_dup store with new vtable: " << NewVtable->getName() << "\n");
-              }
+
+                if (vtable)
+                    break;
             }
-          }
+
+            if (vtable)
+                break;
         }
-      }
+
+        // Duplicate vtable
+        if (vtable && vtable->hasInitializer()) {
+            // Ensure the vtable global variable has an initializer
+            Constant *Initializer = vtable->getInitializer();
+            if (!Initializer || !isa<ConstantStruct>(Initializer)) {
+                errs() << "Error: Vtable initializer is not a ConstantStruct.\n";
+                return;
+            }
+
+            // Extract the array field from the struct
+            ConstantStruct *VTableStruct = cast<ConstantStruct>(Initializer);
+
+            std::vector<Constant *> NewArrayRef;
+
+            for (int i = 0; i < VTableStruct->getNumOperands(); i++) {
+                Constant *ArrayField = VTableStruct->getOperand(i);
+                if (!isa<ConstantArray>(ArrayField)) {
+                    errs() << "Error: Vtable field " << i << " is not a ConstantArray.\n";
+                    continue;
+                }
+
+                ConstantArray *FunctionArray = cast<ConstantArray>(ArrayField);
+
+                // Iterate over elements of the array and modify function pointers
+                std::vector<Constant *> ModifiedElements;
+                for (Value *Elem : FunctionArray->operands()) {
+                    if (isa<Function>(Elem)) {
+                        Function *Func = cast<Function>(Elem);
+                        // Replace with the _dup version of the function
+                        std::string DupName = Func->getName().str() + "_dup";
+                        Function *DupFunction = Md.getFunction(DupName);
+
+                        if (DupFunction) {
+                            // LLVM_DEBUG(dbgs() << "Getting _dup function: " <<
+                            // DupFunction->getName() << "\n");
+                            ModifiedElements.push_back(DupFunction);
+                        } else {
+                            errs()
+                                << "Error: Missing _dup function for: " << Func->getName() << "\n";
+                            ModifiedElements.push_back(cast<Constant>(Elem)); // Keep the original
+                        }
+                    } else {
+                        // Retain non-function elements
+                        ModifiedElements.push_back(cast<Constant>(Elem));
+                    }
+                }
+
+                // Create a new ConstantArray with the modified elements
+                ArrayType *ArrayType = FunctionArray->getType();
+                Constant *NewArray = ConstantArray::get(ArrayType, ModifiedElements);
+                NewArrayRef.push_back(NewArray);
+            }
+
+            // Create a new ConstantStruct for the vtable
+            Constant *NewVTableStruct = ConstantStruct::get(VTableStruct->getType(), NewArrayRef);
+
+            // Create a new global variable for the modified vtable
+            NewVtable = new GlobalVariable(Md, NewVTableStruct->getType(), vtable->isConstant(),
+                                           GlobalValue::ExternalLinkage, NewVTableStruct,
+                                           vtable->getName() + "_dup");
+            NewVtable->setSection(vtable->getSection());
+            LLVM_DEBUG(dbgs() << "[REDDI] Created new vtable: " << NewVtable->getName() << "\n");
+        }
+
+        // In the dup constructor, change the relative store
+        if (NewVtable) {
+            for (auto &BB : *FnDup) {
+                for (auto &I : BB) {
+                    if (isa<StoreInst>(I)) {
+                        auto &SInst = cast<StoreInst>(I);
+                        if (isVTableStore(SInst)) {
+                            if (isa<GetElementPtrInst>(SInst.getValueOperand())) {
+                                // TODO: Should see the uses of the valueOperand to find this inst
+                                // in case it happens
+                                errs() << "Error: GEP instruction not handled\n";
+                            } else if (isa<ConstantExpr>(SInst.getValueOperand())) {
+                                auto *CE = cast<ConstantExpr>(SInst.getValueOperand());
+                                if (CE->getOpcode() == Instruction::GetElementPtr) {
+                                    // Extract the indices and base type
+                                    std::vector<Constant *> Indices = {
+                                        ConstantInt::get(Type::getInt32Ty(Md.getContext()), 0),
+                                        ConstantInt::get(Type::getInt32Ty(Md.getContext()), 0),
+                                        ConstantInt::get(Type::getInt32Ty(Md.getContext()), 2)};
+
+                                    // Create a new GEP ConstantExpr with the new vtable
+                                    auto *NewGEP = ConstantExpr::getGetElementPtr(
+                                        cast<GEPOperator>(CE)->getSourceElementType(), NewVtable,
+                                        Indices, cast<GEPOperator>(CE)->isInBounds());
+
+                                    // Update the store instruction
+                                    SInst.setOperand(0, NewGEP);
+                                }
+                                LLVM_DEBUG(dbgs()
+                                           << "[REDDI] Changed vtable_dup store with new vtable: "
+                                           << NewVtable->getName() << "\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-  }
 }
 
 /**
- * @brief Fill toHardenFunctions and toHardenVariables sets with all the functions and 
+ * @brief Fill toHardenFunctions and toHardenVariables sets with all the functions and
  * global variables that will need to be hardened.
- * 
+ *
  * The rules to enter in toHardenFunctions set are:
  * - Explicitely marked as `to_harden`
  * - Called by a `to_harden` function and not an `exclude` or `to_duplicate` function
  * - Used by a `to_harden` GlobalVariable
  * - Present in a vtable of a `to_harden` object
- * 
+ *
  * The rule to enter in toHardenVariables set is that it is a global variable explicitly
  * marked as `to_harden`
- * 
+ *
  * @param Md The module we are analyzing.
  */
 void EDDI::preprocess(Module &Md) {
-  // Replace all uses of alias to aliasee
-  LLVM_DEBUG(dbgs() << "Replacing aliases\n");
-  for (auto &alias : Md.aliases()) {
-    auto aliasee = alias.getAliaseeObject();
-    if(isa<Function>(aliasee)){
-      alias.replaceAllUsesWith(aliasee);
-    }
-  }
-  LLVM_DEBUG(dbgs() << "\n");
-
-  LLVM_DEBUG(dbgs() << "Getting annotations... ");
-  getFuncAnnotations(Md, FuncAnnotations);
-  LLVM_DEBUG(dbgs() << "[done]\n\n");
-
-  // Getting the explicit `to_harden` functions and Values
-  LLVM_DEBUG(dbgs() << "[REDDI] Getting all the functions and Global variables to harden\n");
-
-  // Choose between EDDI and REDDI
-  if(duplicateAll) {
-    outs() << "EDDI!\n";
-
-    // All the functions are to be hardened except the ones explicitly marked as `exclude` or `to_duplicate`
-    for(auto &F : Md) {
-      if((!F.hasName() || !isToDuplicateName(F.getName())) && (FuncAnnotations.find(&F) == FuncAnnotations.end() || 
-        (!FuncAnnotations.find(&F)->second.starts_with("exclude") && !FuncAnnotations.find(&F)->second.starts_with("to_duplicate")))) {
-        toHardenFunctions.insert(&F);
-      }
-    }
-    
-    // All the Global Variables are to be hardened except the ones explicitly marked as `exclude` or `to_duplicate`
-    for(auto &GV : Md.globals()) {
-      if(GV.hasName() && !isToDuplicateName(GV.getName())) {
-        if(FuncAnnotations.find(&GV) == FuncAnnotations.end() || 
-          (!FuncAnnotations.find(&GV)->second.starts_with("exclude") && !FuncAnnotations.find(&GV)->second.starts_with("to_duplicate"))) {
-          toHardenVariables.insert(&GV);
+    // Replace all uses of alias to aliasee
+    LLVM_DEBUG(dbgs() << "Replacing aliases\n");
+    for (auto &alias : Md.aliases()) {
+        auto aliasee = alias.getAliaseeObject();
+        if (isa<Function>(aliasee)) {
+            alias.replaceAllUsesWith(aliasee);
         }
-      }
-    }
-  } else {
-    outs() << "REDDI!\n";
-    for(auto x : FuncAnnotations) {
-      if(x.second.starts_with("to_harden")) {
-        if(isa<Function>(x.first) && getFunctionDuplicate(cast<Function>(x.first)) == NULL) {
-          // If is a function and it isn't/hasn't a duplicate version already
-          toHardenFunctions.insert(cast<Function>(x.first));
-        } else if(isa<Value>(x.first)) {
-          toHardenVariables.insert(cast<Value>(x.first));
-        }
-      }
     }
     LLVM_DEBUG(dbgs() << "\n");
-  }
 
-  // Getting the explicit `to_harden` functions and Values
-  LLVM_DEBUG(dbgs() << "[REDDI] Getting all the global variables to harden from explicitly to_harden functions\n");
-  for(auto *Fn : toHardenFunctions) {
-    for(auto &BB : *Fn) {
-      for(auto &I : BB) {
-        for(auto &V : I.operands()) {
+    LLVM_DEBUG(dbgs() << "Getting annotations... ");
+    getFuncAnnotations(Md, FuncAnnotations);
+    LLVM_DEBUG(dbgs() << "[done]\n\n");
 
-          if(isa<GlobalVariable>(V) && cast<GlobalVariable>(V)->hasInitializer() && toHardenVariables.find(V) == toHardenVariables.end()) {
-            toHardenVariables.insert(V);
-            LLVM_DEBUG(dbgs() << "Inserting GV from explicit toHarden: " << *V << "\n");
-          } 
-          else if(isa<GEPOperator>(V)) {
-            for(auto &U : cast<GEPOperator>(V)->operands()) {
-              // if(isa<GlobalVariable>(U) && U->hasName() && !isToDuplicateName(U->getName())) {
-              if(isa<GlobalVariable>(U) && cast<GlobalVariable>(U)->hasInitializer() && toHardenVariables.find(U) == toHardenVariables.end()) {
-                toHardenVariables.insert(U);
-                LLVM_DEBUG(dbgs() << "Inserting GV from explicit toHarden from GEPOp: " << *U << "\n");
-              }
+    // Getting the explicit `to_harden` functions and Values
+    LLVM_DEBUG(dbgs() << "[REDDI] Getting all the functions and Global variables to harden\n");
+
+    // Choose between EDDI and REDDI
+    if (duplicateAll) {
+        outs() << "EDDI!\n";
+
+        // All the functions are to be hardened except the ones explicitly marked as `exclude` or
+        // `to_duplicate`
+        for (auto &F : Md) {
+            if ((!F.hasName() || !isToDuplicateName(F.getName())) &&
+                (FuncAnnotations.find(&F) == FuncAnnotations.end() ||
+                 (!FuncAnnotations.find(&F)->second.starts_with("exclude") &&
+                  !FuncAnnotations.find(&F)->second.starts_with("to_duplicate")))) {
+                toHardenFunctions.insert(&F);
             }
-          }
-
         }
-      }
-    }
-  }
-  LLVM_DEBUG(dbgs() << "\n");
 
-  // Collecting all the functions called by a value to be hardened
-  LLVM_DEBUG(dbgs() << "[REDDI] Getting all the functions to harden called by a Global Variable\n");
-  std::set<Value *> toCheckVariables{toHardenVariables};
-  while(!toCheckVariables.empty()){
-    std::set<Value *> toAddVariables; // support set to contain new to-be-checked values
-    for(Value *V : toCheckVariables) {
-      // Just protect the return value of the call, not the operands
-      if((isa<Instruction>(V) || isa<GEPOperator>(V)) && !isa<CallBase>(V)) {
-        auto Instr = cast<User>(V);
-
-        // Check parameters of function
-        for(int i = 0; i < Instr->getNumOperands(); i++) {
-          Value *operand = nullptr;
-
-          // Get operand
-          if(isa<PHINode>(Instr)) {
-            auto PhiInst = cast<PHINode>(Instr);
-            operand = PhiInst->getIncomingValue(i);
-          } else if(isa<Instruction>(Instr->getOperand(i)) || isa<GlobalVariable>(Instr->getOperand(i)) || isa<GEPOperator>(Instr->getOperand(i))) {
-            operand = Instr->getOperand(i);
-          }
-          
-          // Check if to add operand to toAddVariables
-          if(operand != NULL && operand != V && isa<Instruction>(operand) &&
-                toHardenVariables.find(operand) == toHardenVariables.end() && 
-                toCheckVariables.find(operand) == toCheckVariables.end() && 
-                (FuncAnnotations.find(operand) == FuncAnnotations.end() || !FuncAnnotations.find(operand)->second.starts_with("exclude")) && 
-                (!operand->hasName() || !isToDuplicateName(operand->getName())) && 
-                (!isa<AllocaInst>(operand) || !isAllocaForExceptionHandling(*cast<AllocaInst>(operand)))) {
-            toAddVariables.insert(operand);
-          }
-        }
-      }
-
-      for(User *U : V->users()) {
-        if(isa<Instruction>(U) || isa<GEPOperator>(U)) {
-          if(U != NULL && U != V && 
-                toHardenVariables.find(U) == toHardenVariables.end() && 
-                toCheckVariables.find(U) == toCheckVariables.end() && 
-                (FuncAnnotations.find(U) == FuncAnnotations.end() || !FuncAnnotations.find(U)->second.starts_with("exclude")) && 
-                (!U->hasName() || !isToDuplicateName(U->getName())) && 
-                (!isa<AllocaInst>(U) || !isAllocaForExceptionHandling(*cast<AllocaInst>(U)))) {
-            // If it is a call, add also the called function in the toHardenFunction set
-            if(isa<CallBase>(U)) {
-              CallBase *CallI = cast<CallBase>(U);     
-              Function *Fn = CallI->getCalledFunction();  
-              if (Fn != NULL && getFunctionDuplicate(Fn) == NULL && 
-                    (FuncAnnotations.find(Fn) == FuncAnnotations.end() || 
-                      (!FuncAnnotations.find(Fn)->second.starts_with("exclude") && !FuncAnnotations.find(Fn)->second.starts_with("to_duplicate"))) && 
-                    !isToDuplicateName(Fn->getName()) && !Fn->getName().starts_with("__clang_call_terminate")) {
-                // If it isn't/hasn't a duplicate version already
-                toHardenFunctions.insert(Fn);
-                toAddVariables.insert(U);
-              }
-            } else {
-              toAddVariables.insert(U);
+        // All the Global Variables are to be hardened except the ones explicitly marked as
+        // `exclude` or `to_duplicate`
+        for (auto &GV : Md.globals()) {
+            if (GV.hasName() && !isToDuplicateName(GV.getName())) {
+                if (FuncAnnotations.find(&GV) == FuncAnnotations.end() ||
+                    (!FuncAnnotations.find(&GV)->second.starts_with("exclude") &&
+                     !FuncAnnotations.find(&GV)->second.starts_with("to_duplicate"))) {
+                    toHardenVariables.insert(&GV);
+                }
             }
-          }
         }
-      }
-    }
-    toHardenVariables.merge(toCheckVariables);
-    toCheckVariables = toAddVariables;
-  }
-  LLVM_DEBUG(dbgs() << "\n");
-
-  // Recursively retrieve functions to harden
-  LLVM_DEBUG(dbgs() << "[REDDI] Getting all the functions to harden recursively\n");
-  std::set<Function *> JustAddedFns{toHardenFunctions};
-  while(!JustAddedFns.empty()) {
-    // New discovered functions
-    std::set<Function *> toAddFns;
-    for(Function *Fn : JustAddedFns) {
-      // Check if it is a constructor
-      std::string DemangledName = demangle(Fn->getName().str());
-      if(std::regex_match(DemangledName, ConstructorRegex)) {
-        // Add it to the toHardenConstructors set and retrieve all its virtualMethods
-        // if it isn't/hasn't a duplicate version already
-        toHardenConstructors.insert(Fn);
-        toAddFns.merge(getVirtualMethodsFromConstructor(Fn));
-      }
-
-      // Retrieve all the other called functions
-      for(BasicBlock &BB : *Fn) {
-        for(Instruction &I : BB) {
-          if(isa<CallBase>(I)) {
-            if(Function *CalledFn = cast<CallBase>(I).getCalledFunction()) {
-              auto CalledFnEntry = FuncAnnotations.find(CalledFn);
-              bool to_harden = (CalledFnEntry == FuncAnnotations.end()) || 
-                !(CalledFnEntry->second.starts_with("exclude") || CalledFnEntry->second.starts_with("to_duplicate"));
-              LLVM_DEBUG(dbgs() << "[REDDI] " << Fn->getName() << " called " << CalledFn->getName() << 
-                ((CalledFnEntry == FuncAnnotations.end()) ? " (not annotated)" : "") <<
-                ((CalledFnEntry != FuncAnnotations.end() && CalledFnEntry->second.starts_with("exclude")) ? " (exclude)" : "") <<
-                (toHardenFunctions.find(CalledFn) != toHardenFunctions.end() ? " (already in toHardenFunctions)" : "") <<
-                (JustAddedFns.find(CalledFn) != JustAddedFns.end() ? " (already in JustAddedFns)" : "") <<
-                "\n");
-              if(to_harden && toHardenFunctions.find(CalledFn) == toHardenFunctions.end() && 
-                JustAddedFns.find(CalledFn) == JustAddedFns.end() && 
-                getFunctionDuplicate(CalledFn) == NULL && 
-                (FuncAnnotations.find(CalledFn) == FuncAnnotations.end() || 
-                  (!FuncAnnotations.find(CalledFn)->second.starts_with("exclude") && 
-                  !FuncAnnotations.find(CalledFn)->second.starts_with("to_duplicate"))) &&
-                  !isToDuplicateName(CalledFn->getName()) && !CalledFn->getName().starts_with("__clang_call_terminate")) {
-                // If is a new function to and it isn't/hasn't a duplicate version
-                toAddFns.insert(CalledFn);
-                // LLVM_DEBUG(dbgs() << "[REDDI] Added: " << CalledFn->getName() << "\n");
-              }
-            } else {
-              // errs() << "[REDDI] Indirect Function to harden (called by " << Fn->getName() << ")\n";
-              // I.print(errs());
-              // errs() << "\n";
+    } else {
+        outs() << "REDDI!\n";
+        for (auto x : FuncAnnotations) {
+            if (x.second.starts_with("to_harden")) {
+                if (isa<Function>(x.first) &&
+                    getFunctionDuplicate(cast<Function>(x.first)) == NULL) {
+                    // If is a function and it isn't/hasn't a duplicate version already
+                    toHardenFunctions.insert(cast<Function>(x.first));
+                } else if (isa<Value>(x.first)) {
+                    toHardenVariables.insert(cast<Value>(x.first));
+                }
             }
-          }
         }
-      }
+        LLVM_DEBUG(dbgs() << "\n");
     }
 
-    // Add the just analyzed functions to the `toHardenFunctions` set
-    toHardenFunctions.merge(JustAddedFns);
-    // Now analyze the just discovered functions
-    JustAddedFns = toAddFns;
-  }
+    // Getting the explicit `to_harden` functions and Values
+    LLVM_DEBUG(dbgs() << "[REDDI] Getting all the global variables to harden from explicitly "
+                         "to_harden functions\n");
+    for (auto *Fn : toHardenFunctions) {
+        for (auto &BB : *Fn) {
+            for (auto &I : BB) {
+                for (auto &V : I.operands()) {
 
-  LLVM_DEBUG(dbgs() << "[REDDI] preprocess done\n\n");
+                    if (isa<GlobalVariable>(V) && cast<GlobalVariable>(V)->hasInitializer() &&
+                        toHardenVariables.find(V) == toHardenVariables.end()) {
+                        toHardenVariables.insert(V);
+                        LLVM_DEBUG(dbgs() << "Inserting GV from explicit toHarden: " << *V << "\n");
+                    } else if (isa<GEPOperator>(V)) {
+                        for (auto &U : cast<GEPOperator>(V)->operands()) {
+                            // if(isa<GlobalVariable>(U) && U->hasName() &&
+                            // !isToDuplicateName(U->getName())) {
+                            if (isa<GlobalVariable>(U) &&
+                                cast<GlobalVariable>(U)->hasInitializer() &&
+                                toHardenVariables.find(U) == toHardenVariables.end()) {
+                                toHardenVariables.insert(U);
+                                LLVM_DEBUG(dbgs()
+                                           << "Inserting GV from explicit toHarden from GEPOp: "
+                                           << *U << "\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    // Collecting all the functions called by a value to be hardened
+    LLVM_DEBUG(
+        dbgs() << "[REDDI] Getting all the functions to harden called by a Global Variable\n");
+    std::set<Value *> toCheckVariables{toHardenVariables};
+    while (!toCheckVariables.empty()) {
+        std::set<Value *> toAddVariables; // support set to contain new to-be-checked values
+        for (Value *V : toCheckVariables) {
+            // Just protect the return value of the call, not the operands
+            if ((isa<Instruction>(V) || isa<GEPOperator>(V)) && !isa<CallBase>(V)) {
+                auto Instr = cast<User>(V);
+
+                // Check parameters of function
+                for (int i = 0; i < Instr->getNumOperands(); i++) {
+                    Value *operand = nullptr;
+
+                    // Get operand
+                    if (isa<PHINode>(Instr)) {
+                        auto PhiInst = cast<PHINode>(Instr);
+                        operand = PhiInst->getIncomingValue(i);
+                    } else if (isa<Instruction>(Instr->getOperand(i)) ||
+                               isa<GlobalVariable>(Instr->getOperand(i)) ||
+                               isa<GEPOperator>(Instr->getOperand(i))) {
+                        operand = Instr->getOperand(i);
+                    }
+
+                    // Check if to add operand to toAddVariables
+                    if (operand != NULL && operand != V && isa<Instruction>(operand) &&
+                        toHardenVariables.find(operand) == toHardenVariables.end() &&
+                        toCheckVariables.find(operand) == toCheckVariables.end() &&
+                        (FuncAnnotations.find(operand) == FuncAnnotations.end() ||
+                         !FuncAnnotations.find(operand)->second.starts_with("exclude")) &&
+                        (!operand->hasName() || !isToDuplicateName(operand->getName())) &&
+                        (!isa<AllocaInst>(operand) ||
+                         !isAllocaForExceptionHandling(*cast<AllocaInst>(operand)))) {
+                        toAddVariables.insert(operand);
+                    }
+                }
+            }
+
+            for (User *U : V->users()) {
+                if (isa<Instruction>(U) || isa<GEPOperator>(U)) {
+                    if (U != NULL && U != V &&
+                        toHardenVariables.find(U) == toHardenVariables.end() &&
+                        toCheckVariables.find(U) == toCheckVariables.end() &&
+                        (FuncAnnotations.find(U) == FuncAnnotations.end() ||
+                         !FuncAnnotations.find(U)->second.starts_with("exclude")) &&
+                        (!U->hasName() || !isToDuplicateName(U->getName())) &&
+                        (!isa<AllocaInst>(U) ||
+                         !isAllocaForExceptionHandling(*cast<AllocaInst>(U)))) {
+                        // If it is a call, add also the called function in the toHardenFunction set
+                        if (isa<CallBase>(U)) {
+                            CallBase *CallI = cast<CallBase>(U);
+                            Function *Fn = CallI->getCalledFunction();
+                            if (Fn != NULL && getFunctionDuplicate(Fn) == NULL &&
+                                (FuncAnnotations.find(Fn) == FuncAnnotations.end() ||
+                                 (!FuncAnnotations.find(Fn)->second.starts_with("exclude") &&
+                                  !FuncAnnotations.find(Fn)->second.starts_with("to_duplicate"))) &&
+                                !isToDuplicateName(Fn->getName()) &&
+                                !Fn->getName().starts_with("__clang_call_terminate")) {
+                                // If it isn't/hasn't a duplicate version already
+                                toHardenFunctions.insert(Fn);
+                                toAddVariables.insert(U);
+                            }
+                        } else {
+                            toAddVariables.insert(U);
+                        }
+                    }
+                }
+            }
+        }
+        toHardenVariables.merge(toCheckVariables);
+        toCheckVariables = toAddVariables;
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    // Recursively retrieve functions to harden
+    LLVM_DEBUG(dbgs() << "[REDDI] Getting all the functions to harden recursively\n");
+    std::set<Function *> JustAddedFns{toHardenFunctions};
+    while (!JustAddedFns.empty()) {
+        // New discovered functions
+        std::set<Function *> toAddFns;
+        for (Function *Fn : JustAddedFns) {
+            // Check if it is a constructor
+            std::string DemangledName = demangle(Fn->getName().str());
+            if (std::regex_match(DemangledName, ConstructorRegex)) {
+                // Add it to the toHardenConstructors set and retrieve all its virtualMethods
+                // if it isn't/hasn't a duplicate version already
+                toHardenConstructors.insert(Fn);
+                toAddFns.merge(getVirtualMethodsFromConstructor(Fn));
+            }
+
+            // Retrieve all the other called functions
+            for (BasicBlock &BB : *Fn) {
+                for (Instruction &I : BB) {
+                    if (isa<CallBase>(I)) {
+                        if (Function *CalledFn = cast<CallBase>(I).getCalledFunction()) {
+                            auto CalledFnEntry = FuncAnnotations.find(CalledFn);
+                            bool to_harden = (CalledFnEntry == FuncAnnotations.end()) ||
+                                             !(CalledFnEntry->second.starts_with("exclude") ||
+                                               CalledFnEntry->second.starts_with("to_duplicate"));
+                            LLVM_DEBUG(
+                                dbgs()
+                                << "[REDDI] " << Fn->getName() << " called " << CalledFn->getName()
+                                << ((CalledFnEntry == FuncAnnotations.end()) ? " (not annotated)"
+                                                                             : "")
+                                << ((CalledFnEntry != FuncAnnotations.end() &&
+                                     CalledFnEntry->second.starts_with("exclude"))
+                                        ? " (exclude)"
+                                        : "")
+                                << (toHardenFunctions.find(CalledFn) != toHardenFunctions.end()
+                                        ? " (already in toHardenFunctions)"
+                                        : "")
+                                << (JustAddedFns.find(CalledFn) != JustAddedFns.end()
+                                        ? " (already in JustAddedFns)"
+                                        : "")
+                                << "\n");
+                            if (to_harden &&
+                                toHardenFunctions.find(CalledFn) == toHardenFunctions.end() &&
+                                JustAddedFns.find(CalledFn) == JustAddedFns.end() &&
+                                getFunctionDuplicate(CalledFn) == NULL &&
+                                (FuncAnnotations.find(CalledFn) == FuncAnnotations.end() ||
+                                 (!FuncAnnotations.find(CalledFn)->second.starts_with("exclude") &&
+                                  !FuncAnnotations.find(CalledFn)->second.starts_with(
+                                      "to_duplicate"))) &&
+                                !isToDuplicateName(CalledFn->getName()) &&
+                                !CalledFn->getName().starts_with("__clang_call_terminate")) {
+                                // If is a new function to and it isn't/hasn't a duplicate version
+                                toAddFns.insert(CalledFn);
+                                // LLVM_DEBUG(dbgs() << "[REDDI] Added: " << CalledFn->getName() <<
+                                // "\n");
+                            }
+                        } else {
+                            // errs() << "[REDDI] Indirect Function to harden (called by " <<
+                            // Fn->getName() << ")\n"; I.print(errs()); errs() << "\n";
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add the just analyzed functions to the `toHardenFunctions` set
+        toHardenFunctions.merge(JustAddedFns);
+        // Now analyze the just discovered functions
+        JustAddedFns = toAddFns;
+    }
+
+    LLVM_DEBUG(dbgs() << "[REDDI] preprocess done\n\n");
 }
 
 /**
@@ -557,34 +589,34 @@ void EDDI::preprocess(Module &Md) {
  * @param Use is the instruction that has I as operand
  */
 int EDDI::isUsedByStore(Instruction &I, Instruction &Use) {
-  BasicBlock *BB = I.getParent();
-  /* get I users and check whether the BB of I is in the successors of the user
-   */
-  for (User *U : I.users()) {
-    if (isa<StoreInst>(U) && U != &Use) {
-      Instruction *U_st = cast<StoreInst>(U);
-      // find BB in U_st successors
-      std::unordered_set<BasicBlock *> reachable;
-      std::queue<BasicBlock *> worklist;
-      worklist.push(U_st->getParent());
-      while (!worklist.empty()) {
-        BasicBlock *front = worklist.front();
-        if (front == BB)
-          return 1;
-        worklist.pop();
-        for (BasicBlock *succ : successors(front)) {
-          if (reachable.count(succ) == 0) {
-            /// We need the check here to ensure that we don't run
-            /// infinitely if the CFG has a loop in it
-            /// i.e. the BB reaches itself directly or indirectly
-            worklist.push(succ);
-            reachable.insert(succ);
-          }
+    BasicBlock *BB = I.getParent();
+    /* get I users and check whether the BB of I is in the successors of the user
+     */
+    for (User *U : I.users()) {
+        if (isa<StoreInst>(U) && U != &Use) {
+            Instruction *U_st = cast<StoreInst>(U);
+            // find BB in U_st successors
+            std::unordered_set<BasicBlock *> reachable;
+            std::queue<BasicBlock *> worklist;
+            worklist.push(U_st->getParent());
+            while (!worklist.empty()) {
+                BasicBlock *front = worklist.front();
+                if (front == BB)
+                    return 1;
+                worklist.pop();
+                for (BasicBlock *succ : successors(front)) {
+                    if (reachable.count(succ) == 0) {
+                        /// We need the check here to ensure that we don't run
+                        /// infinitely if the CFG has a loop in it
+                        /// i.e. the BB reaches itself directly or indirectly
+                        worklist.push(succ);
+                        reachable.insert(succ);
+                    }
+                }
+            }
         }
-      }
     }
-  }
-  return 0;
+    return 0;
 }
 
 /**
@@ -592,58 +624,59 @@ int EDDI::isUsedByStore(Instruction &I, Instruction &Use) {
  * DuplicatedInstructionMap, inserting the clone right after the original.
  */
 Instruction *EDDI::cloneInstr(Instruction &I) {
-  Instruction *IClone = I.clone();
+    Instruction *IClone = I.clone();
 
-  if (!I.getType()->isVoidTy() && I.hasName()) {
-    IClone->setName(I.getName() + "_dup");
-  }
+    if (!I.getType()->isVoidTy() && I.hasName()) {
+        IClone->setName(I.getName() + "_dup");
+    }
 
-  // if the instruction is an alloca and alternate-memmap is disabled, place it
-  // at the end of the list of alloca instruction
-  if (AlternateMemMapEnabled == false && isa<AllocaInst>(I)) {
-    IClone->insertBefore(&*I.getParent()->getFirstNonPHIOrDbgOrAlloca());
-  } // else place it right after the instruction we are working on
-  else {
-    IClone->insertAfter(&I);
-    ClonedInstructions.insert(IClone);
-  }
-  DuplicatedInstructionMap.insert(
-      std::pair<Instruction *, Instruction *>(&I, IClone));
-  DuplicatedInstructionMap.insert(
-      std::pair<Instruction *, Instruction *>(IClone, &I));
-  return IClone;
+    // if the instruction is an alloca and alternate-memmap is disabled, place it
+    // at the end of the list of alloca instruction
+    if (AlternateMemMapEnabled == false && isa<AllocaInst>(I)) {
+        IClone->insertBefore(&*I.getParent()->getFirstNonPHIOrDbgOrAlloca());
+    } // else place it right after the instruction we are working on
+    else {
+        IClone->insertAfter(&I);
+        ClonedInstructions.insert(IClone);
+    }
+    DuplicatedInstructionMap.insert(std::pair<Instruction *, Instruction *>(&I, IClone));
+    DuplicatedInstructionMap.insert(std::pair<Instruction *, Instruction *>(IClone, &I));
+    return IClone;
 }
 
 Value *EDDI::getDuplicateValue(Value *V, Function *Fn) {
-  // Fast path if V is a local variable, it should have only one duplicate
-  if(!isa<GlobalValue>(V) || isa<Argument>(V)) {
-    assert((DuplicatedInstructionMap.count(V) <= 1) && "Local variable has more than one duplicate");
-    
-    Value *duplicate = (DuplicatedInstructionMap.find(V) != DuplicatedInstructionMap.end()) ? 
-      DuplicatedInstructionMap.find(V)->second : 
-      nullptr;
+    // Fast path if V is a local variable, it should have only one duplicate
+    if (!isa<GlobalValue>(V) || isa<Argument>(V)) {
+        assert((DuplicatedInstructionMap.count(V) <= 1) &&
+               "Local variable has more than one duplicate");
 
-    return duplicate;
-  }
+        Value *duplicate = (DuplicatedInstructionMap.find(V) != DuplicatedInstructionMap.end())
+                               ? DuplicatedInstructionMap.find(V)->second
+                               : nullptr;
 
-  // Get all the duplicates of V
-  auto [begin, end] = DuplicatedInstructionMap.equal_range(V);
-  // Check which element is the appropriate duplicate, i.e. the one that is in the same Function of I
-  for (auto it = begin; it != end; ++it) {
-    Value *duplicate = it->second;
-
-    if(isa<GlobalValue>(duplicate)) {
-      // If it is a global variable, we can return it directly
-      return duplicate;
-    } else {
-      // If it is an instruction, we need to check if it is in the same function of I
-      if (isa<Instruction>(duplicate) && cast<Instruction>(duplicate)->getParent()->getParent() == Fn) {
         return duplicate;
-      }
     }
-  }
-  
-  return nullptr;
+
+    // Get all the duplicates of V
+    auto [begin, end] = DuplicatedInstructionMap.equal_range(V);
+    // Check which element is the appropriate duplicate, i.e. the one that is in the same Function
+    // of I
+    for (auto it = begin; it != end; ++it) {
+        Value *duplicate = it->second;
+
+        if (isa<GlobalValue>(duplicate)) {
+            // If it is a global variable, we can return it directly
+            return duplicate;
+        } else {
+            // If it is an instruction, we need to check if it is in the same function of I
+            if (isa<Instruction>(duplicate) &&
+                cast<Instruction>(duplicate)->getParent()->getParent() == Fn) {
+                return duplicate;
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 /**
@@ -651,434 +684,452 @@ Value *EDDI::getDuplicateValue(Value *V, Function *Fn) {
  * duplicated operand in the duplicated instruction IClone.
  */
 void EDDI::duplicateOperands(Instruction &I) {
-  // see if I has a clone
-  Value *Clone = getDuplicateValue(&I, I.getFunction());
-  Instruction *IClone = nullptr;
-  if(Clone != nullptr && isa<Instruction>(Clone)) {
-    IClone = cast<Instruction>(Clone);
-  }
-
-  int J = 0;
-  // iterate over the operands and switch them with their duplicates in the
-  // duplicated instructions
-  for (Value *V : I.operand_values()) {
-    // if the operand has not been duplicated we need to duplicate it
-    if (isa<Instruction>(V)) {
-      Instruction *Operand = cast<Instruction>(V);
-      if (!isValueDuplicated(*Operand)) {
-        if(duplicateInstruction(*Operand)) {
-          if(InstructionsToRemove.find(Operand) == InstructionsToRemove.end()) {
-            InstructionsToRemove.insert(Operand);
-          }
-        }
-      }
+    // see if I has a clone
+    Value *Clone = getDuplicateValue(&I, I.getFunction());
+    Instruction *IClone = nullptr;
+    if (Clone != nullptr && isa<Instruction>(Clone)) {
+        IClone = cast<Instruction>(Clone);
     }
-    // It may happen that we have a GEP as inline operand of a instruction. The
-    // operands of the GEP are not duplicated leading to errors, so we manually
-    // clone of the GEP for the clone of the original instruction.
-    else if (isa<GEPOperator>(V) && isa<ConstantExpr>(V)) {
-      if (IClone != nullptr) {
-        GEPOperator *GEPOperand = cast<GEPOperator>(IClone->getOperand(J));
-        Value *PtrOperand = GEPOperand->getPointerOperand();
-        Value *ClonePtrOperand = getDuplicateValue(PtrOperand, I.getFunction());
-        // update the duplicate GEP operator using the duplicate of the pointer
-        // operand
-        if (ClonePtrOperand != nullptr) {
-          std::vector<Value *> indices;
-          for (auto &Idx : GEPOperand->indices()) {
-            indices.push_back(Idx);
-          }
-          Constant *CloneGEPOperand =
-              cast<ConstantExpr>(GEPOperand)
-                  ->getInBoundsGetElementPtr(
-                      GEPOperand->getSourceElementType(),
-                      cast<Constant>(ClonePtrOperand),
-                      ArrayRef<Value *>(indices));
-          IClone->setOperand(J, CloneGEPOperand);
+
+    int J = 0;
+    // iterate over the operands and switch them with their duplicates in the
+    // duplicated instructions
+    for (Value *V : I.operand_values()) {
+        // if the operand has not been duplicated we need to duplicate it
+        if (isa<Instruction>(V)) {
+            Instruction *Operand = cast<Instruction>(V);
+            if (!isValueDuplicated(*Operand)) {
+                if (duplicateInstruction(*Operand)) {
+                    if (InstructionsToRemove.find(Operand) == InstructionsToRemove.end()) {
+                        InstructionsToRemove.insert(Operand);
+                    }
+                }
+            }
         }
-      }
-    } else if (isa<Function>(V)) {
-      // if the operand is a function we need to set the duplicate function as
-      // operand of the clone instruction
-      Function *FnOperand = cast<Function>(V);
-      auto DuplicateFn = getFunctionDuplicate(FnOperand);
-      if (DuplicateFn != NULL) {
-        I.setOperand(J, DuplicateFn);
+        // It may happen that we have a GEP as inline operand of a instruction. The
+        // operands of the GEP are not duplicated leading to errors, so we manually
+        // clone of the GEP for the clone of the original instruction.
+        else if (isa<GEPOperator>(V) && isa<ConstantExpr>(V)) {
+            if (IClone != nullptr) {
+                GEPOperator *GEPOperand = cast<GEPOperator>(IClone->getOperand(J));
+                Value *PtrOperand = GEPOperand->getPointerOperand();
+                Value *ClonePtrOperand = getDuplicateValue(PtrOperand, I.getFunction());
+                // update the duplicate GEP operator using the duplicate of the pointer
+                // operand
+                if (ClonePtrOperand != nullptr) {
+                    std::vector<Value *> indices;
+                    for (auto &Idx : GEPOperand->indices()) {
+                        indices.push_back(Idx);
+                    }
+                    Constant *CloneGEPOperand =
+                        cast<ConstantExpr>(GEPOperand)
+                            ->getInBoundsGetElementPtr(GEPOperand->getSourceElementType(),
+                                                       cast<Constant>(ClonePtrOperand),
+                                                       ArrayRef<Value *>(indices));
+                    IClone->setOperand(J, CloneGEPOperand);
+                }
+            }
+        } else if (isa<Function>(V)) {
+            // if the operand is a function we need to set the duplicate function as
+            // operand of the clone instruction
+            Function *FnOperand = cast<Function>(V);
+            auto DuplicateFn = getFunctionDuplicate(FnOperand);
+            if (DuplicateFn != NULL) {
+                I.setOperand(J, DuplicateFn);
+                if (IClone != nullptr) {
+                    IClone->setOperand(J, DuplicateFn);
+                }
+            }
+        } else if (isa<StoreInst>(I) && isa<GlobalVariable>(V) &&
+                   cast<GlobalVariable>(V)->isConstant()) {
+            IRBuilder<> B(&I);
+            synchronizeFunctionArguments(*I.getModule(), V, B, &I, true);
+        }
+
         if (IClone != nullptr) {
-          IClone->setOperand(J, DuplicateFn);
+            // use the duplicated instruction as operand of IClone
+            Value *CloneOperand = getDuplicateValue(V, I.getFunction());
+            if (CloneOperand != nullptr) {
+                IClone->setOperand(J,
+                                   CloneOperand); // set the J-th operand with the duplicate value
+            }
         }
-      }
-    } else if (isa<StoreInst>(I) && isa<GlobalVariable>(V) && cast<GlobalVariable>(V)->isConstant()) {
-      IRBuilder<> B(&I);
-      synchronizeFunctionArguments(*I.getModule(), V, B, &I, true);
+        J++;
     }
-
-    if (IClone != nullptr) {
-      // use the duplicated instruction as operand of IClone
-      Value *CloneOperand = getDuplicateValue(V, I.getFunction());
-      if (CloneOperand != nullptr) {
-        IClone->setOperand(J, CloneOperand); // set the J-th operand with the duplicate value
-      }
-    }
-    J++;
-  }
 }
 
 tda::TransparentType *EDDI::getBestType(Value *V) {
-  TransparentTypeFactory ttf;
-  tda::TransparentType *VTy = nullptr;
+    TransparentTypeFactory ttf;
+    tda::TransparentType *VTy = nullptr;
 
-  auto TTIter = deducedTypes.transparentTypes.find(V);
+    auto TTIter = deducedTypes.transparentTypes.find(V);
 
-  if (TTIter != deducedTypes.transparentTypes.end() && TTIter->second.size() == 1) {
-    VTy = TTIter->second.begin()->get();
+    if (TTIter != deducedTypes.transparentTypes.end() && TTIter->second.size() == 1) {
+        VTy = TTIter->second.begin()->get();
+        return VTy;
+    }
+
+    if (isa<AllocaInst>(V) && cast<AllocaInst>(V)->getAllocatedType() &&
+        !cast<AllocaInst>(V)->getAllocatedType()->isPointerTy()) {
+
+        auto newTy = ttf.createFromType(cast<AllocaInst>(V)->getAllocatedType(), 1);
+        VTy = newTy.get(); // grab the raw pointer while we still own it
+        deducedTypes.transparentTypes[V].insert(
+            std::move(newTy)); // then transfer ownership into the map
+    }
+
     return VTy;
-  }
-
-  if (isa<AllocaInst>(V) &&
-      cast<AllocaInst>(V)->getAllocatedType() &&
-      !cast<AllocaInst>(V)->getAllocatedType()->isPointerTy()) {
-
-    auto newTy = ttf.createFromType(cast<AllocaInst>(V)->getAllocatedType(), 1);
-    VTy = newTy.get();                                  // grab the raw pointer while we still own it
-    deducedTypes.transparentTypes[V].insert(std::move(newTy)); // then transfer ownership into the map
-  }
-
-  return VTy;
 }
 
 bool EDDI::ptrNotDereferenceable(Value &V) {
-  if(isa<CallInst>(V) && cast<CallInst>(V).getCalledFunction() != nullptr) {
-    auto DemangledName = demangle(cast<CallInst>(V).getCalledFunction()->getName().str());
+    if (isa<CallInst>(V) && cast<CallInst>(V).getCalledFunction() != nullptr) {
+        auto DemangledName = demangle(cast<CallInst>(V).getCalledFunction()->getName().str());
 
-    if(DemangledName.find("std::") != DemangledName.npos && DemangledName.find("::end()") != DemangledName.npos) {
-      errs() << "Warning: Pointer " << V << " is not dereferenceable because it is the result of an end() function\n";
-      return true;
+        if (DemangledName.find("std::") != DemangledName.npos &&
+            DemangledName.find("::end()") != DemangledName.npos) {
+            errs() << "Warning: Pointer " << V
+                   << " is not dereferenceable because it is the result of an end() function\n";
+            return true;
+        }
     }
-  }
 
-  return false;
+    return false;
 }
 
 // Follows the pointers V1 and V2 and adds a compare
 // instruction using the IRBuilder B.
-void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &V2, IRBuilder<> &B) {
-  /**
-   * synthax `store val, ptr`
-   *
-   * There is the following case:
-   * store a, b
-   * store b, c
-   *
-   * If I have c, I need to perform 2 loads: one load for finding b and one load
-   * for finding a _b = load c _a = load _b
-   */
+void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &V2,
+                       IRBuilder<> &B) {
+    /**
+     * synthax `store val, ptr`
+     *
+     * There is the following case:
+     * store a, b
+     * store b, c
+     *
+     * If I have c, I need to perform 2 loads: one load for finding b and one load
+     * for finding a _b = load c _a = load _b
+     */
 
-  Value *F1 = &V1;
-  Value *F2 = &V2;
+    Value *F1 = &V1;
+    Value *F2 = &V2;
 
-  if(!deducedTypes.transparentTypes.contains(&V1) || !deducedTypes.transparentTypes.contains(&V2)) {
-    errs() << "Warning: " << V1 << " or " << V2 << " not in deduced types\n";
-    return;
-  }
-
-  tda::TransparentType *V1Ty = getBestType(F1);
-  tda::TransparentType *V2Ty = getBestType(F2);
-
-  if(V1Ty == nullptr || V1Ty->isOpaquePtr()) {
-    errs() << "Warning 1: Can't find final value for pointer " << V1 << "\n";
-    return;
-  }
-
-  if(V2Ty == nullptr || V2Ty->isOpaquePtr()) {
-    errs() << "Warning 2: Can't find final value for pointer " << V1 << "\n";
-    return;
-  }
-
-  if(ptrNotDereferenceable(V1)) {
-    errs() << "Warning 1: Pointer " << V1 << " is not dereferenceable\n";
-    return;
-  }
-    
-  assert(((V1Ty->isPointerTT() && V1.getType()->isPointerTy()) || (V2Ty->isPointerTT() && V2.getType()->isPointerTy())) && "No pointers found");
-
-  while(V1Ty->isPointerTT()) {
-    V1Ty = V1Ty->getPointedType();
-
-    if(V1Ty == nullptr) {
-      errs() << "Warning1: Can't find final value for pointer " << V1 << "\n";
-      return;
+    if (!deducedTypes.transparentTypes.contains(&V1) ||
+        !deducedTypes.transparentTypes.contains(&V2)) {
+        errs() << "Warning: " << V1 << " or " << V2 << " not in deduced types\n";
+        return;
     }
 
-    if(F1->getType()->isPointerTy()) {
-      F1 = B.CreateLoad(V1Ty->getLLVMType(), F1);
-    }
-  }
+    tda::TransparentType *V1Ty = getBestType(F1);
+    tda::TransparentType *V2Ty = getBestType(F2);
 
-  while(V2Ty->isPointerTT()) {
-    V2Ty = V2Ty->getPointedType();
-
-    if(V2Ty == nullptr) {
-      errs() << "Warning2: Can't find final value for pointer " << V2 << "\n";
-      return;
+    if (V1Ty == nullptr || V1Ty->isOpaquePtr()) {
+        errs() << "Warning 1: Can't find final value for pointer " << V1 << "\n";
+        return;
     }
 
-    if(F2->getType()->isPointerTy()) {
-      F2 = B.CreateLoad(V2Ty->getLLVMType(), F2);
+    if (V2Ty == nullptr || V2Ty->isOpaquePtr()) {
+        errs() << "Warning 2: Can't find final value for pointer " << V1 << "\n";
+        return;
     }
-  }
 
-  if(F1->getType() != F2->getType()) {
-    errs() << "Warning: Can't compare pointers " << V1.getName() << " and " << V2.getName() << " because their final value have incompatible types: " << *F1 << " and " << *F2 << "\n";
-    return;
-  }
+    if (ptrNotDereferenceable(V1)) {
+        errs() << "Warning 1: Pointer " << V1 << " is not dereferenceable\n";
+        return;
+    }
 
-  deducedTypes.transparentTypes[F1].insert(V1Ty->clone());
-  deducedTypes.transparentTypes[F2].insert(V2Ty->clone());
+    assert(((V1Ty->isPointerTT() && V1.getType()->isPointerTy()) ||
+            (V2Ty->isPointerTT() && V2.getType()->isPointerTy())) &&
+           "No pointers found");
 
-  compareValues(CmpInstructions, *F1, *F2, B);
+    while (V1Ty->isPointerTT()) {
+        V1Ty = V1Ty->getPointedType();
+
+        if (V1Ty == nullptr) {
+            errs() << "Warning1: Can't find final value for pointer " << V1 << "\n";
+            return;
+        }
+
+        if (F1->getType()->isPointerTy()) {
+            F1 = B.CreateLoad(V1Ty->getLLVMType(), F1);
+        }
+    }
+
+    while (V2Ty->isPointerTT()) {
+        V2Ty = V2Ty->getPointedType();
+
+        if (V2Ty == nullptr) {
+            errs() << "Warning2: Can't find final value for pointer " << V2 << "\n";
+            return;
+        }
+
+        if (F2->getType()->isPointerTy()) {
+            F2 = B.CreateLoad(V2Ty->getLLVMType(), F2);
+        }
+    }
+
+    if (F1->getType() != F2->getType()) {
+        errs() << "Warning: Can't compare pointers " << V1.getName() << " and " << V2.getName()
+               << " because their final value have incompatible types: " << *F1 << " and " << *F2
+               << "\n";
+        return;
+    }
+
+    deducedTypes.transparentTypes[F1].insert(V1Ty->clone());
+    deducedTypes.transparentTypes[F2].insert(V2Ty->clone());
+
+    compareValues(CmpInstructions, *F1, *F2, B);
 }
-
 
 bool isLocalValueInitializedBefore(Instruction *AI, Instruction *At) {
 
-  assert(AI->getParent()->getParent() == At->getParent()->getParent() && "Alloca and Instruction not in the same function!");
+    assert(AI->getParent()->getParent() == At->getParent()->getParent() &&
+           "Alloca and Instruction not in the same function!");
 
-  std::unordered_set<StoreInst *> storeInsts;
+    std::unordered_set<StoreInst *> storeInsts;
 
-  // TODO: Check if it is needed to consider other virtual registers that alias that same value
-  for (User *U : AI->users()) {
-    if (auto *SI = dyn_cast<StoreInst>(U)) {
-      if (SI->getPointerOperand() == AI) {
-        storeInsts.insert(SI);
-        errs() << "\t[store] " << *SI << "\n";
-      }
-    }
-  }
-
-  // If no store instructions found with target to that alloca
-  if(storeInsts.empty()) {
-    return false;
-  }
-
-  std::vector<Instruction *> InstToBeCheckedFrom{AI};
-  std::set<Instruction *> InstCheckedFrom;
-  while(!InstToBeCheckedFrom.empty()) {
-    Instruction *I = InstToBeCheckedFrom.back();
-    InstToBeCheckedFrom.pop_back();
-    InstCheckedFrom.insert(I);
-
-    if(I == nullptr) {
-      errs() << "\tCONTINUED!\n";
-      continue;
+    // TODO: Check if it is needed to consider other virtual registers that alias that same value
+    for (User *U : AI->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand() == AI) {
+                storeInsts.insert(SI);
+                errs() << "\t[store] " << *SI << "\n";
+            }
+        }
     }
 
-    do {
-      if(I == At) {
+    // If no store instructions found with target to that alloca
+    if (storeInsts.empty()) {
         return false;
-      }
+    }
 
-      if(isa<BranchInst>(I)) {
-        for(int i = 0; i < cast<BranchInst>(I)->getNumSuccessors(); i++) {
-          auto addInst = cast<BranchInst>(I)->getSuccessor(i)->getFirstNonPHI();
-          // If doesn't exist the first instruction in the BB it will probably be the BB for the check we are building
-          if(addInst == nullptr) {
-            return false;
-          } else if(InstCheckedFrom.find(addInst) == InstCheckedFrom.end()) {
-            InstToBeCheckedFrom.push_back(addInst);
-          }
+    std::vector<Instruction *> InstToBeCheckedFrom{AI};
+    std::set<Instruction *> InstCheckedFrom;
+    while (!InstToBeCheckedFrom.empty()) {
+        Instruction *I = InstToBeCheckedFrom.back();
+        InstToBeCheckedFrom.pop_back();
+        InstCheckedFrom.insert(I);
+
+        if (I == nullptr) {
+            errs() << "\tCONTINUED!\n";
+            continue;
         }
-      } else if (isa<InvokeInst>(I)) {
-        auto addInst = cast<InvokeInst>(I)->getNormalDest()->getFirstNonPHI();
-        if(addInst == nullptr) {
-            return false;
-        } else if(InstCheckedFrom.find(addInst) == InstCheckedFrom.end()) {
-          InstToBeCheckedFrom.push_back(addInst);
-        }
-      }
 
-      // If it is a valid store to end, continue to search for another path that does not initialize the alloca variale.
-      if(isa<StoreInst>(I) && storeInsts.find(cast<StoreInst>(I)) != storeInsts.end()) {
-        break;
-      }
-      
-      // return false if we don't have a next node before encountering a store
-      if(I->getNextNode() == nullptr) {
-        return false;
-      }
-    } while(I = I->getNextNode());
-  }
+        do {
+            if (I == At) {
+                return false;
+            }
 
-  return true;
+            if (isa<BranchInst>(I)) {
+                for (int i = 0; i < cast<BranchInst>(I)->getNumSuccessors(); i++) {
+                    auto addInst = cast<BranchInst>(I)->getSuccessor(i)->getFirstNonPHI();
+                    // If doesn't exist the first instruction in the BB it will probably be the BB
+                    // for the check we are building
+                    if (addInst == nullptr) {
+                        return false;
+                    } else if (InstCheckedFrom.find(addInst) == InstCheckedFrom.end()) {
+                        InstToBeCheckedFrom.push_back(addInst);
+                    }
+                }
+            } else if (isa<InvokeInst>(I)) {
+                auto addInst = cast<InvokeInst>(I)->getNormalDest()->getFirstNonPHI();
+                if (addInst == nullptr) {
+                    return false;
+                } else if (InstCheckedFrom.find(addInst) == InstCheckedFrom.end()) {
+                    InstToBeCheckedFrom.push_back(addInst);
+                }
+            }
+
+            // If it is a valid store to end, continue to search for another path that does not
+            // initialize the alloca variale.
+            if (isa<StoreInst>(I) && storeInsts.find(cast<StoreInst>(I)) != storeInsts.end()) {
+                break;
+            }
+
+            // return false if we don't have a next node before encountering a store
+            if (I->getNextNode() == nullptr) {
+                return false;
+            }
+        } while (I = I->getNextNode());
+    }
+
+    return true;
 }
 
 /**
  * Adds a consistency check on the instruction I
  */
 void EDDI::addConsistencyChecks(Instruction &I, BasicBlock &ErrBB) {
-  std::vector<Value *> CmpInstructions;
+    std::vector<Value *> CmpInstructions;
 
-  // split and add the verification BB
-  auto BBpred = I.getParent()->splitBasicBlockBefore(&I);
-  BasicBlock *VerificationBB =
-      BasicBlock::Create(I.getContext(), "VerificationBB",
-                         I.getParent()->getParent(), I.getParent());
-  I.getParent()->replaceUsesWithIf(BBpred, IsNotAPHINode);
-  auto BI = cast<BranchInst>(BBpred->getTerminator());
-  BI->setSuccessor(0, VerificationBB);
-  IRBuilder<> B(VerificationBB);
+    // split and add the verification BB
+    auto BBpred = I.getParent()->splitBasicBlockBefore(&I);
+    BasicBlock *VerificationBB = BasicBlock::Create(I.getContext(), "VerificationBB",
+                                                    I.getParent()->getParent(), I.getParent());
+    I.getParent()->replaceUsesWithIf(BBpred, IsNotAPHINode);
+    auto BI = cast<BranchInst>(BBpred->getTerminator());
+    BI->setSuccessor(0, VerificationBB);
+    IRBuilder<> B(VerificationBB);
 
-  // if the instruction is a call with indirect function, we try to get a compare
-  if(isa<CallBase>(I) && cast<CallBase>(I).isIndirectCall()) {
-    Value *Duplicate = getDuplicateValue(cast<CallBase>(I).getCalledOperand(), I.getFunction());
-    if (Duplicate != nullptr) {
-      Value *Original = cast<CallBase>(I).getCalledOperand();
-      Value *Copy = Duplicate;
+    // if the instruction is a call with indirect function, we try to get a compare
+    if (isa<CallBase>(I) && cast<CallBase>(I).isIndirectCall()) {
+        Value *Duplicate = getDuplicateValue(cast<CallBase>(I).getCalledOperand(), I.getFunction());
+        if (Duplicate != nullptr) {
+            Value *Original = cast<CallBase>(I).getCalledOperand();
+            Value *Copy = Duplicate;
 
-      // Directly comparing the function pointers
-      auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, Original, Copy);
-      CmpInstructions.push_back(Cmp);
-      DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
-      comparisonCounter++;
-    }
-  }
-
-  if(isa<StoreInst>(I)) {
-    IRBuilder<> tmpB(VerificationBB);
-    createCompareOnOperand(&CmpInstructions, cast<StoreInst>(I).getValueOperand(), I, tmpB);
-  } else {
-    // add a comparison for each operand
-    std::set<Value *> checked;
-    for (Value *V : I.operand_values()) {
-      if(checked.find(V) == checked.end()) {
-        IRBuilder<> tmpB(VerificationBB);
-        createCompareOnOperand(&CmpInstructions, V, I, tmpB);
-        
-        auto dupV = getDuplicateValue(V, I.getFunction());
-        checked.insert(V);
-        if(dupV) {
-          checked.insert(dupV);
+            // Directly comparing the function pointers
+            auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, Original, Copy);
+            CmpInstructions.push_back(Cmp);
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
+            comparisonCounter++;
         }
-      }
     }
-  }
 
-  // if in the end we have a set of compare instructions, we check that all of
-  // them are true
-  if (!CmpInstructions.empty()) {
-    // all comparisons must be true
-    Value *AndInstr = B.CreateAnd(CmpInstructions);
-    auto CondBrInst = B.CreateCondBr(AndInstr, I.getParent(), &ErrBB);
-    if (DebugEnabled) {
-      CondBrInst->setDebugLoc(I.getDebugLoc());
-    }
-  }
-
-  if (!VerificationBB->getTerminator()) {
-    auto BrInst = B.CreateBr(I.getParent());
-    if (DebugEnabled) {
-      BrInst->setDebugLoc(I.getDebugLoc());
-    }
-  }
-}
-
-void EDDI::createCompareOnOperand(std::vector<Value *> *CmpInstructions, Value *V, Instruction &I, IRBuilder<> &B) {
-  auto Duplicate = getDuplicateValue(V, I.getFunction());
-
-  // if the duplicate doesn't exist, we cannot perform a compare
-  if (Duplicate == nullptr) {
-    return;
-  }
-
-  if(isa<AllocaInst>(V)) {
-    if(!isLocalValueInitializedBefore(cast<Instruction>(V), &I)) {
-      return;
-    }
-  } else if(isa<GetElementPtrInst>(V)) {
-    // TODO: What to do here?
-    if(!isLocalValueInitializedBefore(cast<Instruction>(V), &I)) {
-      return;
-    }
-  } else {
-    // TODO: are there other cases to support?
-  }
-
-  Value *Original = V;
-  Value *Copy = Duplicate;
-
-  compareValues(CmpInstructions, *Original, *Copy, B);
-}
-
-void EDDI::compareValues(std::vector<Value *> *CmpInstructions, Value &V1, Value &V2, IRBuilder<> &B, bool checkCompositeTypes) {
-  TransparentType *V1Ty = getBestType(&V1);
-  TransparentType *V2Ty = getBestType(&V2);
-
-  if(V1Ty == nullptr || V1Ty->containsOpaquePtr() || V2Ty == nullptr || V2Ty->containsOpaquePtr() ) {
-    return;
-  }
-
-  if(V1Ty->isPointerTT() || V2Ty->isPointerTT()) {
-    comparePtrs(CmpInstructions, V1, V2, B);
-  } else if(V1Ty->isPrimitiveTT()) {
-    if(V1Ty->isIntegerTyOrPtrTo()) {
-      auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, &V1, &V2);
-      CmpInstructions->push_back(Cmp);
-      DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
-      comparisonCounter++;
-    } else if(V1Ty->isFloatingPointTyOrPtrTo()) {
-      auto Cmp = B.CreateCmp(CmpInst::FCMP_UEQ, &V1, &V2);
-      CmpInstructions->push_back(Cmp);
-      DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
-      comparisonCounter++;
+    if (isa<StoreInst>(I)) {
+        IRBuilder<> tmpB(VerificationBB);
+        createCompareOnOperand(&CmpInstructions, cast<StoreInst>(I).getValueOperand(), I, tmpB);
     } else {
-      errs() << "Warning: Unsupported primitive type for comparison: " << V1Ty->toString() << "\n";
-      return;
+        // add a comparison for each operand
+        std::set<Value *> checked;
+        for (Value *V : I.operand_values()) {
+            if (checked.find(V) == checked.end()) {
+                IRBuilder<> tmpB(VerificationBB);
+                createCompareOnOperand(&CmpInstructions, V, I, tmpB);
+
+                auto dupV = getDuplicateValue(V, I.getFunction());
+                checked.insert(V);
+                if (dupV) {
+                    checked.insert(dupV);
+                }
+            }
+        }
     }
-  } else if(checkCompositeTypes) {
-    if(V1Ty->isStructTT()) {
-      TransparentTypeFactory ttf;
-      for (unsigned i = 0; i < V1Ty->getLLVMType()->getStructNumElements(); i++) {
-        Value *OriginalElem = B.CreateExtractValue(&V1, i);
-        Value *CopyElem = B.CreateExtractValue(&V2, i);
-        DuplicatedInstructionMap.insert(
-            std::pair<Value *, Value *>(OriginalElem, CopyElem));
-        DuplicatedInstructionMap.insert(
-            std::pair<Value *, Value *>(CopyElem, OriginalElem));
 
-        auto newTy = ttf.createFromType(cast<ExtractValueInst>(OriginalElem)->getIndexedType(V1Ty->getLLVMType(), i), 0);
-        auto ElTy = newTy.get();
-        deducedTypes.transparentTypes[OriginalElem].insert(ElTy->clone());
-        deducedTypes.transparentTypes[CopyElem].insert(ElTy->clone());
-
-        compareValues(CmpInstructions, *OriginalElem, *CopyElem, B, false);
-      }
-    } else if(V1Ty->isArrayTT()) {
-      int arraysize = V1Ty->getLLVMType()->getArrayNumElements();
-
-      // TODO: understand if is possible to remove the extracted values when no check is performed
-      TransparentTypeFactory ttf;
-      for (int i = 0; i < arraysize; i++) {
-        Value *OriginalElem = B.CreateExtractValue(&V1, i);
-        Value *CopyElem = B.CreateExtractValue(&V2, i);
-        DuplicatedInstructionMap.insert(
-            std::pair<Value *, Value *>(OriginalElem, CopyElem));
-        DuplicatedInstructionMap.insert(
-            std::pair<Value *, Value *>(CopyElem, OriginalElem));
-
-        auto newTy = ttf.createFromType(cast<ExtractValueInst>(OriginalElem)->getIndexedType(V1Ty->getLLVMType(), i), 0);
-        auto ElTy = newTy.get();
-        deducedTypes.transparentTypes[OriginalElem].insert(ElTy->clone());
-        deducedTypes.transparentTypes[CopyElem].insert(ElTy->clone());
-
-        compareValues(CmpInstructions,*OriginalElem, *CopyElem, B, false);
-      }
-    } else {
-      errs() << "Warning: Unsupported type for comparison: " << V1Ty->toString() << "\n";
-      return;
+    // if in the end we have a set of compare instructions, we check that all of
+    // them are true
+    if (!CmpInstructions.empty()) {
+        // all comparisons must be true
+        Value *AndInstr = B.CreateAnd(CmpInstructions);
+        auto CondBrInst = B.CreateCondBr(AndInstr, I.getParent(), &ErrBB);
+        if (DebugEnabled) {
+            CondBrInst->setDebugLoc(I.getDebugLoc());
+        }
     }
-  }
+
+    if (!VerificationBB->getTerminator()) {
+        auto BrInst = B.CreateBr(I.getParent());
+        if (DebugEnabled) {
+            BrInst->setDebugLoc(I.getDebugLoc());
+        }
+    }
 }
 
+void EDDI::createCompareOnOperand(std::vector<Value *> *CmpInstructions, Value *V, Instruction &I,
+                                  IRBuilder<> &B) {
+    auto Duplicate = getDuplicateValue(V, I.getFunction());
+
+    // if the duplicate doesn't exist, we cannot perform a compare
+    if (Duplicate == nullptr) {
+        return;
+    }
+
+    if (isa<AllocaInst>(V)) {
+        if (!isLocalValueInitializedBefore(cast<Instruction>(V), &I)) {
+            return;
+        }
+    } else if (isa<GetElementPtrInst>(V)) {
+        // TODO: What to do here?
+        if (!isLocalValueInitializedBefore(cast<Instruction>(V), &I)) {
+            return;
+        }
+    } else {
+        // TODO: are there other cases to support?
+    }
+
+    Value *Original = V;
+    Value *Copy = Duplicate;
+
+    compareValues(CmpInstructions, *Original, *Copy, B);
+}
+
+void EDDI::compareValues(std::vector<Value *> *CmpInstructions, Value &V1, Value &V2,
+                         IRBuilder<> &B, bool checkCompositeTypes) {
+    TransparentType *V1Ty = getBestType(&V1);
+    TransparentType *V2Ty = getBestType(&V2);
+
+    if (V1Ty == nullptr || V1Ty->containsOpaquePtr() || V2Ty == nullptr ||
+        V2Ty->containsOpaquePtr()) {
+        return;
+    }
+
+    if (V1Ty->isPointerTT() || V2Ty->isPointerTT()) {
+        comparePtrs(CmpInstructions, V1, V2, B);
+    } else if (V1Ty->isPrimitiveTT()) {
+        if (V1Ty->isIntegerTyOrPtrTo()) {
+            auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, &V1, &V2);
+            CmpInstructions->push_back(Cmp);
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
+            comparisonCounter++;
+        } else if (V1Ty->isFloatingPointTyOrPtrTo()) {
+            auto Cmp = B.CreateCmp(CmpInst::FCMP_UEQ, &V1, &V2);
+            CmpInstructions->push_back(Cmp);
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
+            comparisonCounter++;
+        } else {
+            errs() << "Warning: Unsupported primitive type for comparison: " << V1Ty->toString()
+                   << "\n";
+            return;
+        }
+    } else if (checkCompositeTypes) {
+        if (V1Ty->isStructTT()) {
+            TransparentTypeFactory ttf;
+            for (unsigned i = 0; i < V1Ty->getLLVMType()->getStructNumElements(); i++) {
+                Value *OriginalElem = B.CreateExtractValue(&V1, i);
+                Value *CopyElem = B.CreateExtractValue(&V2, i);
+                DuplicatedInstructionMap.insert(
+                    std::pair<Value *, Value *>(OriginalElem, CopyElem));
+                DuplicatedInstructionMap.insert(
+                    std::pair<Value *, Value *>(CopyElem, OriginalElem));
+
+                auto newTy = ttf.createFromType(
+                    cast<ExtractValueInst>(OriginalElem)->getIndexedType(V1Ty->getLLVMType(), i),
+                    0);
+                auto ElTy = newTy.get();
+                deducedTypes.transparentTypes[OriginalElem].insert(ElTy->clone());
+                deducedTypes.transparentTypes[CopyElem].insert(ElTy->clone());
+
+                compareValues(CmpInstructions, *OriginalElem, *CopyElem, B, false);
+            }
+        } else if (V1Ty->isArrayTT()) {
+            int arraysize = V1Ty->getLLVMType()->getArrayNumElements();
+
+            // TODO: understand if is possible to remove the extracted values when no check is
+            // performed
+            TransparentTypeFactory ttf;
+            for (int i = 0; i < arraysize; i++) {
+                Value *OriginalElem = B.CreateExtractValue(&V1, i);
+                Value *CopyElem = B.CreateExtractValue(&V2, i);
+                DuplicatedInstructionMap.insert(
+                    std::pair<Value *, Value *>(OriginalElem, CopyElem));
+                DuplicatedInstructionMap.insert(
+                    std::pair<Value *, Value *>(CopyElem, OriginalElem));
+
+                auto newTy = ttf.createFromType(
+                    cast<ExtractValueInst>(OriginalElem)->getIndexedType(V1Ty->getLLVMType(), i),
+                    0);
+                auto ElTy = newTy.get();
+                deducedTypes.transparentTypes[OriginalElem].insert(ElTy->clone());
+                deducedTypes.transparentTypes[CopyElem].insert(ElTy->clone());
+
+                compareValues(CmpInstructions, *OriginalElem, *CopyElem, B, false);
+            }
+        } else {
+            errs() << "Warning: Unsupported type for comparison: " << V1Ty->toString() << "\n";
+            return;
+        }
+    }
+}
 
 // Given an instruction, loads and stores the pointers passed to the
 // instruction. This is useful in the case I is a CallBase, since the function
@@ -1086,282 +1137,280 @@ void EDDI::compareValues(std::vector<Value *> *CmpInstructions, Value &V1, Value
 // modify the content of the pointer passed as argument. This function has the
 // objective of synchronize pointers after some non-duplicated instruction
 // execution.
-void EDDI::fixFuncValsPassedByReference(
-    Instruction &I,
-    IRBuilder<> &B) {
-  int numOps = I.getNumOperands();
-  for (int i = 0; i < numOps; i++) {
-    Value *V = I.getOperand(i);
-    if (isa<Instruction>(V)) {
-      Instruction *Operand = cast<Instruction>(V);
-      Value *Duplicate = getDuplicateValue(Operand, I.getFunction());
+void EDDI::fixFuncValsPassedByReference(Instruction &I, IRBuilder<> &B) {
+    int numOps = I.getNumOperands();
+    for (int i = 0; i < numOps; i++) {
+        Value *V = I.getOperand(i);
+        if (isa<Instruction>(V)) {
+            Instruction *Operand = cast<Instruction>(V);
+            Value *Duplicate = getDuplicateValue(Operand, I.getFunction());
 
-      if (Duplicate != nullptr) {
-        if((Operand->getType()->isPointerTy() && Duplicate->getType()->isPointerTy()) || (isa<GlobalVariable>(Operand) && isa<GlobalVariable>(Duplicate))) {
-          synchronizeFunctionArguments(*I.getModule(), Operand, B, &I, false);
+            if (Duplicate != nullptr) {
+                if ((Operand->getType()->isPointerTy() && Duplicate->getType()->isPointerTy()) ||
+                    (isa<GlobalVariable>(Operand) && isa<GlobalVariable>(Duplicate))) {
+                    synchronizeFunctionArguments(*I.getModule(), Operand, B, &I, false);
+                }
+            }
         }
-      }
     }
-  }
 }
 
 // Given Fn, it returns the version of the function with duplicated arguments,
 // or the function Fn itself if it is already the version with duplicated
 // arguments
 Function *EDDI::getFunctionDuplicate(Function *Fn) {
-  // If Fn ends with "_dup" we have already the duplicated function.
-  // If Fn is NULL, it means that we don't have a duplicate
-  if (Fn == nullptr || Fn->getName().ends_with("_dup")) {
-    return Fn;
-  }
+    // If Fn ends with "_dup" we have already the duplicated function.
+    // If Fn is NULL, it means that we don't have a duplicate
+    if (Fn == nullptr || Fn->getName().ends_with("_dup")) {
+        return Fn;
+    }
 
-  // Otherwise, we try to get the "_dup" version or the "_ret_dup" version
-  Function *FnDup = Fn->getParent()->getFunction(Fn->getName().str() + "_dup");
-  if (FnDup == NULL) {
-    FnDup = Fn->getParent()->getFunction(Fn->getName().str() + "_ret_dup");
-  }
-  return FnDup;
+    // Otherwise, we try to get the "_dup" version or the "_ret_dup" version
+    Function *FnDup = Fn->getParent()->getFunction(Fn->getName().str() + "_dup");
+    if (FnDup == NULL) {
+        FnDup = Fn->getParent()->getFunction(Fn->getName().str() + "_ret_dup");
+    }
+    return FnDup;
 }
 
 // Given Fn, it returns the version of the function without the duplicated
 // arguments, or the function Fn itself if it is already the version without
 // duplicated arguments
 Function *EDDI::getFunctionFromDuplicate(Function *Fn) {
-  // If Fn ends with "_dup" we have already the duplicated function.
-  // If Fn is NULL, it means that we don't have a duplicate
-  if (Fn == NULL || !Fn->getName().ends_with("_dup")) {
-    return Fn;
-  }
+    // If Fn ends with "_dup" we have already the duplicated function.
+    // If Fn is NULL, it means that we don't have a duplicate
+    if (Fn == NULL || !Fn->getName().ends_with("_dup")) {
+        return Fn;
+    }
 
-  // Otherwise, we try to get the non-"_dup" version
-  Function *FnDup = Fn->getParent()->getFunction(
-      Fn->getName().str().substr(0, Fn->getName().str().length() - 8));
-  if (FnDup == NULL || FnDup == Fn) {
-    FnDup = Fn->getParent()->getFunction(
-        Fn->getName().str().substr(0, Fn->getName().str().length() - 4));
-  }
-  return FnDup;
+    // Otherwise, we try to get the non-"_dup" version
+    Function *FnDup = Fn->getParent()->getFunction(
+        Fn->getName().str().substr(0, Fn->getName().str().length() - 8));
+    if (FnDup == NULL || FnDup == Fn) {
+        FnDup = Fn->getParent()->getFunction(
+            Fn->getName().str().substr(0, Fn->getName().str().length() - 4));
+    }
+    return FnDup;
 }
 
 void EDDI::duplicateGlobals(Module &Md) {
-  Value *RuntimeSig;
-  Value *RetSig;
-  std::list<GlobalVariable *> GVars;
-  for (auto *V : toHardenVariables) {
-    if(isa<GlobalVariable>(V)) {
-      GVars.push_back(cast<GlobalVariable>(V));
+    Value *RuntimeSig;
+    Value *RetSig;
+    std::list<GlobalVariable *> GVars;
+    for (auto *V : toHardenVariables) {
+        if (isa<GlobalVariable>(V)) {
+            GVars.push_back(cast<GlobalVariable>(V));
+        }
     }
-  }
-  for (auto GV : GVars) {
-    auto GVAnnotation = FuncAnnotations.find(GV);
+    for (auto GV : GVars) {
+        auto GVAnnotation = FuncAnnotations.find(GV);
 
-    if (GV->getName().empty()) {
-      GV->setName("global_" + std::to_string(globalVarCounter++));
-    }
+        if (GV->getName().empty()) {
+            GV->setName("global_" + std::to_string(globalVarCounter++));
+        }
 
-    if (!isa<Function>(GV) &&
-        GVAnnotation != FuncAnnotations.end()) {
-      // What does these annotations do?
-      if (GVAnnotation->second.starts_with("runtime_sig") ||
-          GVAnnotation->second.starts_with("run_adj_sig")) {
-        continue;
-      }
-    }
-    /**
-     * The global variable is duplicated if all the following hold:
-     * - It is not a function
-     * - It is not constant (i.e. read only)
-     * - It is not a struct
-     * - Doesn't end with "_dup" (i.e. has already been duplicated)
-     * - Has internal linkage and either:
-     *        a) It is not an array
-     *        b) It is an array but its elements are neither structs nor arrays
-     */
-    bool isFunction = GV->getType()->isFunctionTy();
-    bool isConstant = GV->isConstant();
-    bool isStruct = GV->getValueType()->isStructTy();
-    bool isArray = GV->getValueType()->isArrayTy();
-    bool isPointer = GV->getValueType()->isPointerTy();
-    bool ends_withDup = GV->getName().ends_with("_dup");
-    bool isExtern = GV->hasExternalLinkage() && GV->isDeclaration();
-    bool hasInternalLinkage = GV->hasInternalLinkage();
-    bool isMetadataInfo = GV->getSection() == "llvm.metadata";
-    bool isReservedName = GV->getName().starts_with("llvm.");
-    bool toExclude = !isa<Function>(GV) &&
-                     GVAnnotation != FuncAnnotations.end() &&
-                     GVAnnotation->second.starts_with("exclude");
+        if (!isa<Function>(GV) && GVAnnotation != FuncAnnotations.end()) {
+            // What does these annotations do?
+            if (GVAnnotation->second.starts_with("runtime_sig") ||
+                GVAnnotation->second.starts_with("run_adj_sig")) {
+                continue;
+            }
+        }
+        /**
+         * The global variable is duplicated if all the following hold:
+         * - It is not a function
+         * - It is not constant (i.e. read only)
+         * - It is not a struct
+         * - Doesn't end with "_dup" (i.e. has already been duplicated)
+         * - Has internal linkage and either:
+         *        a) It is not an array
+         *        b) It is an array but its elements are neither structs nor arrays
+         */
+        bool isFunction = GV->getType()->isFunctionTy();
+        bool isConstant = GV->isConstant();
+        bool isStruct = GV->getValueType()->isStructTy();
+        bool isArray = GV->getValueType()->isArrayTy();
+        bool isPointer = GV->getValueType()->isPointerTy();
+        bool ends_withDup = GV->getName().ends_with("_dup");
+        bool isExtern = GV->hasExternalLinkage() && GV->isDeclaration();
+        bool hasInternalLinkage = GV->hasInternalLinkage();
+        bool isMetadataInfo = GV->getSection() == "llvm.metadata";
+        bool isReservedName = GV->getName().starts_with("llvm.");
+        bool toExclude = !isa<Function>(GV) && GVAnnotation != FuncAnnotations.end() &&
+                         GVAnnotation->second.starts_with("exclude");
 
-    if (! (isFunction || isConstant || isExtern || ends_withDup || isMetadataInfo || isReservedName || toExclude) // is not function, constant, struct and does not end with _dup
+        if (! (isFunction || isConstant || isExtern || ends_withDup || isMetadataInfo || isReservedName || toExclude) // is not function, constant, struct and does not end with _dup
         /* && ((hasInternalLinkage && (!isArray || (isArray && !cast<ArrayType>(GV.getValueType())->getArrayElementType()->isAggregateType() ))) // has internal linkage and is not an array, or is an array but the element type is not aggregate
             || !isArray) */ // if it does not have internal linkage, it is not an array or a pointer
         ) {
-      Constant *Initializer = nullptr;
-      if (GV->hasInitializer()) {
-        Initializer = GV->getInitializer();
-      }
+            Constant *Initializer = nullptr;
+            if (GV->hasInitializer()) {
+                Initializer = GV->getInitializer();
+            }
 
-      GlobalVariable *InsertBefore;
+            GlobalVariable *InsertBefore;
 
-      if (AlternateMemMapEnabled == false) {
-        InsertBefore = GVars.front();
-      } else {
-        InsertBefore = GV;
-      }
+            if (AlternateMemMapEnabled == false) {
+                InsertBefore = GVars.front();
+            } else {
+                InsertBefore = GV;
+            }
 
-      // get a copy of the global variable
-      GlobalVariable *GVCopy = new GlobalVariable(
-          Md, GV->getValueType(), false, GV->getLinkage(), Initializer,
-          GV->getName() + "_dup", InsertBefore, GV->getThreadLocalMode(),
-          GV->getAddressSpace(), GV->isExternallyInitialized());
+            // get a copy of the global variable
+            GlobalVariable *GVCopy =
+                new GlobalVariable(Md, GV->getValueType(), false, GV->getLinkage(), Initializer,
+                                   GV->getName() + "_dup", InsertBefore, GV->getThreadLocalMode(),
+                                   GV->getAddressSpace(), GV->isExternallyInitialized());
 
-      if (AlternateMemMapEnabled == false && !GV->hasSection() &&
-          !GV->hasInitializer()) {
-        GVCopy->setSection(DuplicateSecName);
-      }
+            if (AlternateMemMapEnabled == false && !GV->hasSection() && !GV->hasInitializer()) {
+                GVCopy->setSection(DuplicateSecName);
+            }
 
-      GVCopy->setAlignment(GV->getAlign());
-      GVCopy->setDSOLocal(GV->isDSOLocal());
-      // Save the duplicated global so that the duplicate can be used as operand
-      // of other duplicated instructions
-      DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GV, GVCopy));
-      DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GVCopy, GV));
+            GVCopy->setAlignment(GV->getAlign());
+            GVCopy->setDSOLocal(GV->isDSOLocal());
+            // Save the duplicated global so that the duplicate can be used as operand
+            // of other duplicated instructions
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GV, GVCopy));
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GVCopy, GV));
+        }
     }
-  }
 }
 
-bool EDDI::isAllocaForExceptionHandling(AllocaInst &I){
-  for (auto e : I.users())
-  {
-    if (isa<StoreInst>(e)){
-      StoreInst *storeInst=cast<StoreInst>(e);
-      auto *valueOperand =storeInst->getValueOperand();
-      if(isa<CallBase>(valueOperand)){
-        CallBase *callInst = cast<CallBase>(valueOperand);
-        if (callInst->getCalledFunction() != NULL && callInst->getCalledFunction()->getName() == "__cxa_begin_catch")
-        {return true;}
-      }
-      
+bool EDDI::isAllocaForExceptionHandling(AllocaInst &I) {
+    for (auto e : I.users()) {
+        if (isa<StoreInst>(e)) {
+            StoreInst *storeInst = cast<StoreInst>(e);
+            auto *valueOperand = storeInst->getValueOperand();
+            if (isa<CallBase>(valueOperand)) {
+                CallBase *callInst = cast<CallBase>(valueOperand);
+                if (callInst->getCalledFunction() != NULL &&
+                    callInst->getCalledFunction()->getName() == "__cxa_begin_catch") {
+                    return true;
+                }
+            }
+        }
     }
-  }
-  return false;
+    return false;
 }
 
 int EDDI::transformCallBaseInst(CallBase *CInstr, IRBuilder<> &B) {
-  int res = 0;
-  SmallVector<Value *, 6> args;
-  SmallVector<Type *, 6> ParamTypes;
-  
-  Function *Callee = CInstr->getCalledFunction();
-  Function *Fn = getFunctionDuplicate(Callee);
+    int res = 0;
+    SmallVector<Value *, 6> args;
+    SmallVector<Type *, 6> ParamTypes;
 
-  if(Callee != NULL && (Fn == NULL || Fn == Callee)) {
-    errs() << "Error: Doesn't exist or already duplicated function: " << *CInstr << "\n";
-    return 0;
-  }
+    Function *Callee = CInstr->getCalledFunction();
+    Function *Fn = getFunctionDuplicate(Callee);
 
-  for (unsigned i = 0; i < CInstr->arg_size(); i++) {
-    // Populate args and ParamTypes from the original instruction
-    Value *Arg = CInstr->getArgOperand(i);
-
-    // see if Original has a copy
-    Value *Copy = getDuplicateValue(Arg, CInstr->getFunction());
-    if(Copy == nullptr) {
-      Copy = Arg;
+    if (Callee != NULL && (Fn == NULL || Fn == Callee)) {
+        errs() << "Error: Doesn't exist or already duplicated function: " << *CInstr << "\n";
+        return 0;
     }
 
-    // Duplicating only fixed parameters, passing just one time the variadic arguments
-    if(Callee != NULL && Callee->getFunctionType() != NULL && i >= Callee->getFunctionType()->getNumParams()) {
-      args.push_back(Arg);
-      if(Callee == NULL) {
-        ParamTypes.push_back(Arg->getType());
-      }
-    } else {
-      if (!AlternateMemMapEnabled) {
-        args.insert(args.begin() + i, Copy);
-        args.push_back(Arg);
-        if(Callee == NULL) {
-          ParamTypes.insert(ParamTypes.begin() + i, Arg->getType());
-          ParamTypes.push_back(Arg->getType());
+    for (unsigned i = 0; i < CInstr->arg_size(); i++) {
+        // Populate args and ParamTypes from the original instruction
+        Value *Arg = CInstr->getArgOperand(i);
+
+        // see if Original has a copy
+        Value *Copy = getDuplicateValue(Arg, CInstr->getFunction());
+        if (Copy == nullptr) {
+            Copy = Arg;
         }
-      } else {
-        args.push_back(Copy);
-        args.push_back(Arg);
-        if(Callee == NULL) {
-          ParamTypes.push_back(Arg->getType());
-          ParamTypes.push_back(Arg->getType());
+
+        // Duplicating only fixed parameters, passing just one time the variadic arguments
+        if (Callee != NULL && Callee->getFunctionType() != NULL &&
+            i >= Callee->getFunctionType()->getNumParams()) {
+            args.push_back(Arg);
+            if (Callee == NULL) {
+                ParamTypes.push_back(Arg->getType());
+            }
+        } else {
+            if (!AlternateMemMapEnabled) {
+                args.insert(args.begin() + i, Copy);
+                args.push_back(Arg);
+                if (Callee == NULL) {
+                    ParamTypes.insert(ParamTypes.begin() + i, Arg->getType());
+                    ParamTypes.push_back(Arg->getType());
+                }
+            } else {
+                args.push_back(Copy);
+                args.push_back(Arg);
+                if (Callee == NULL) {
+                    ParamTypes.push_back(Arg->getType());
+                    ParamTypes.push_back(Arg->getType());
+                }
+            }
         }
-      }
-    }
-  }
-
-  Instruction *NewCInstr = nullptr;
-  IRBuilder<> CallBuilder(CInstr);
-
-  // In case of duplication of an indirect call, call the function with doubled parameters
-  if (Callee == NULL) {
-    // Create the new function type
-    Type *ReturnType = CInstr->getType();
-    FunctionType *FuncType = FunctionType::get(ReturnType, ParamTypes, false);
-
-    // Create a dummy function pointer (Fn) for the new call
-    Value *Fn = CallBuilder.CreateBitCast(CInstr->getCalledOperand(), FuncType->getPointerTo());
-
-    // Create the new call or invoke instruction
-    if (isa<InvokeInst>(CInstr)) {
-      InvokeInst *IInst=cast<InvokeInst>(CInstr);
-      NewCInstr = CallBuilder.CreateInvoke(
-          FuncType, Fn, IInst->getNormalDest(), IInst->getUnwindDest(), args);
-    } else {
-      NewCInstr = CallBuilder.CreateCall(FuncType, Fn, args);
     }
 
-    // Transfer parameter attributes
-    for (unsigned i = 0; i < CInstr->arg_size(); ++i) {
-      AttributeSet ParamAttrs = CInstr->getAttributes().getParamAttrs(i);
-      for(auto &attr : ParamAttrs) {
-        if(attr.getKindAsEnum() != Attribute::AttrKind::StructRet){
-          // Assuming that indirect function calls aren't variadic
-          if (!AlternateMemMapEnabled) {
-            cast<CallBase>(NewCInstr)->addParamAttr(i, attr);
-            cast<CallBase>(NewCInstr)->addParamAttr(i + CInstr->arg_size(), attr);
-          } else {
-            cast<CallBase>(NewCInstr)->addParamAttr(i*2, attr);
-            cast<CallBase>(NewCInstr)->addParamAttr(i*2 + 1 , attr);
-          }
+    Instruction *NewCInstr = nullptr;
+    IRBuilder<> CallBuilder(CInstr);
+
+    // In case of duplication of an indirect call, call the function with doubled parameters
+    if (Callee == NULL) {
+        // Create the new function type
+        Type *ReturnType = CInstr->getType();
+        FunctionType *FuncType = FunctionType::get(ReturnType, ParamTypes, false);
+
+        // Create a dummy function pointer (Fn) for the new call
+        Value *Fn = CallBuilder.CreateBitCast(CInstr->getCalledOperand(), FuncType->getPointerTo());
+
+        // Create the new call or invoke instruction
+        if (isa<InvokeInst>(CInstr)) {
+            InvokeInst *IInst = cast<InvokeInst>(CInstr);
+            NewCInstr = CallBuilder.CreateInvoke(FuncType, Fn, IInst->getNormalDest(),
+                                                 IInst->getUnwindDest(), args);
+        } else {
+            NewCInstr = CallBuilder.CreateCall(FuncType, Fn, args);
         }
-      }
-    }
 
-    // Copy metadata and debug location
-    if (DebugEnabled) {
-      NewCInstr->setDebugLoc(CInstr->getDebugLoc());
-    }
+        // Transfer parameter attributes
+        for (unsigned i = 0; i < CInstr->arg_size(); ++i) {
+            AttributeSet ParamAttrs = CInstr->getAttributes().getParamAttrs(i);
+            for (auto &attr : ParamAttrs) {
+                if (attr.getKindAsEnum() != Attribute::AttrKind::StructRet) {
+                    // Assuming that indirect function calls aren't variadic
+                    if (!AlternateMemMapEnabled) {
+                        cast<CallBase>(NewCInstr)->addParamAttr(i, attr);
+                        cast<CallBase>(NewCInstr)->addParamAttr(i + CInstr->arg_size(), attr);
+                    } else {
+                        cast<CallBase>(NewCInstr)->addParamAttr(i * 2, attr);
+                        cast<CallBase>(NewCInstr)->addParamAttr(i * 2 + 1, attr);
+                    }
+                }
+            }
+        }
 
-    // Replace the old instruction with the new one
-    CInstr->replaceNonMetadataUsesWith(NewCInstr);
+        // Copy metadata and debug location
+        if (DebugEnabled) {
+            NewCInstr->setDebugLoc(CInstr->getDebugLoc());
+        }
 
-    // Remove original instruction since we created the duplicated version
-    res = 1;
-  } else {
-    if (isa<InvokeInst>(CInstr)) {
-      InvokeInst *IInst=cast<InvokeInst>(CInstr);
-      NewCInstr = CallBuilder.CreateInvoke(Fn->getFunctionType(), Fn,IInst->getNormalDest(),IInst->getUnwindDest(), args);
+        // Replace the old instruction with the new one
+        CInstr->replaceNonMetadataUsesWith(NewCInstr);
+
+        // Remove original instruction since we created the duplicated version
+        res = 1;
     } else {
-      NewCInstr =  CallBuilder.CreateCall(Fn->getFunctionType(), Fn, args);
+        if (isa<InvokeInst>(CInstr)) {
+            InvokeInst *IInst = cast<InvokeInst>(CInstr);
+            NewCInstr = CallBuilder.CreateInvoke(Fn->getFunctionType(), Fn, IInst->getNormalDest(),
+                                                 IInst->getUnwindDest(), args);
+        } else {
+            NewCInstr = CallBuilder.CreateCall(Fn->getFunctionType(), Fn, args);
+        }
+
+        if (DebugEnabled) {
+            NewCInstr->setDebugLoc(CInstr->getDebugLoc());
+        }
+        res = 1;
+        CInstr->replaceNonMetadataUsesWith(NewCInstr);
     }
 
-    if (DebugEnabled) {
-      NewCInstr->setDebugLoc(CInstr->getDebugLoc());
+    if (NewCInstr) {
+        DuplicatedCalls.insert(NewCInstr);
     }
-    res = 1;
-    CInstr->replaceNonMetadataUsesWith(NewCInstr);
-  }
 
-  if(NewCInstr) {
-    DuplicatedCalls.insert(NewCInstr);
-  }
-
-  return res;
+    return res;
 }
 
 /**
@@ -1372,175 +1421,182 @@ int EDDI::transformCallBaseInst(CallBase *CInstr, IRBuilder<> &B) {
  * @returns 1 if the cloned instruction has to be removed, 0 otherwise
  */
 int EDDI::duplicateInstruction(Instruction &I) {
-  if (isValueDuplicated(I)) {
-    return 0;
-  }
-
-  if(I.isVolatile()) {
-    bool shouldDuplicateAnyway = false;
-    if(isa<LoadInst>(I)) {
-      if(FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand()) != FuncAnnotations.end() && 
-          (FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand())->second.starts_with("to_duplicate") || FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand())->second.starts_with("to_harden"))) {
-        shouldDuplicateAnyway = true;
-      } else if(I.getType()->isIntegerTy()) {
-        IRBuilder<> B(&I);
-        auto Idup = B.CreateAdd(&I, llvm::ConstantInt::get(I.getType(), 0));
-        cast<Instruction>(Idup)->moveAfter(&I);
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(&I, Idup));
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Idup, &I));
-      } else if(I.getType()->isFloatingPointTy()) {
-        IRBuilder<> B(&I);
-        auto Idup = B.CreateAdd(&I, llvm::ConstantFP::get(I.getType(), 0));
-        cast<Instruction>(Idup)->moveAfter(&I);
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(&I, Idup));
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Idup, &I));
-      }
-    } else if(isa<StoreInst>(I)) {
-      if(getDuplicateValue(cast<StoreInst>(I).getPointerOperand(), I.getFunction()) != nullptr) {
-        shouldDuplicateAnyway = true;
-      }
-    }
-    if(!shouldDuplicateAnyway) {
-      return 0;
-    }
-  } else if (isa<CallBase>(I) && cast<CallBase>(I).isInlineAsm()) {
-    return 0;
-  }
-
-  Instruction *clonedInst = nullptr;
-  int res = 0;
-
-  // if the instruction is an alloca instruction we need to duplicate it
-  if (isa<AllocaInst>(I)) {
-    
-    if (!isAllocaForExceptionHandling(cast<AllocaInst>(I))){
-      
-      clonedInst = cloneInstr(I);
-
-    };
-
-    
-  }
-
-  // if the instruction is a binary/unary instruction we need to duplicate it
-  // checking for its operands
-  else if (isa<BinaryOperator, UnaryInstruction, LoadInst, GetElementPtrInst,
-               CmpInst, PHINode, SelectInst,InsertValueInst>(I)) {
-    // duplicate the instruction
-    clonedInst = cloneInstr(I);
-
-    // duplicate the operands
-    duplicateOperands(I);
-  }
-
-  // if the instruction is a store instruction we need to duplicate it and its
-  // operands (if not duplicated already) and add consistency checks
-  else if (isa<StoreInst, AtomicRMWInst, AtomicCmpXchgInst>(I)) {
-    Instruction *IClone = cloneInstr(I);
-
-    // duplicate the operands
-    duplicateOperands(I);
-
-    // it may happen that I duplicate a store but don't change its operands, if
-    // that happens I just remove the duplicate
-    if (IClone->isIdenticalTo(&I)) {
-      IClone->eraseFromParent();
-
-      Value *Copy = getDuplicateValue(&I, I.getFunction());
-      if(Copy != nullptr) {
-        DuplicatedInstructionMap.erase(Copy);
-        DuplicatedInstructionMap.erase(&I);
-      }
-    }
-  }
-
-  // if the instruction is a branch/switch/return instruction, we need to
-  // duplicate its operands (if not duplicated already) and add consistency
-  // checks
-  else if (isa<BranchInst, SwitchInst, ReturnInst, IndirectBrInst>(I)) {
-    // duplicate the operands
-    duplicateOperands(I);
-  }
-
-  // if the istruction is a non-already-duplicated call, we duplicate the operands and add consistency
-  // checks
-  else if (isa<CallBase>(I) && DuplicatedCalls.find(&I) == DuplicatedCalls.end()) {
-    DuplicatedCalls.insert(&I);
-    CallBase *CInstr = cast<CallBase>(&I);
-    // there are some instructions that can be annotated with "to_duplicate" in
-    // order to tell the pass to duplicate the function call.
-    Function *Callee = CInstr->getCalledFunction();
-    Callee = getFunctionFromDuplicate(Callee);
-
-    if((FuncAnnotations.find(Callee) != FuncAnnotations.end() && FuncAnnotations.find(Callee)->second.starts_with("exclude")) || (Callee != NULL && isToExclude(CInstr))) {
-      IRBuilder<> B(CInstr);
-      fixFuncValsPassedByReference(*CInstr, B);
-
-      return 0;
+    if (isValueDuplicated(I)) {
+        return 0;
     }
 
-    // check if the function call has to be duplicated
-    if ((FuncAnnotations.find(Callee) != FuncAnnotations.end() && FuncAnnotations.find(Callee)->second.starts_with("to_duplicate")) ||
-        (Callee != NULL && isToDuplicate(CInstr))) {
-      // duplicate the instruction
-      clonedInst = cloneInstr(*CInstr);
-
-      // duplicate the operands
-      duplicateOperands(I);
-
-      if(isa<InvokeInst>(I)) {
-        // In case of an invoke instruction, we have to fix the first invoke since 
-        // it would jump to the next BB and not to the duplicated invoke instruction
-        auto *IInstr = &cast<InvokeInst>(I);
-        toFixInvokes.insert(IInstr);
-      }
+    if (I.isVolatile()) {
+        bool shouldDuplicateAnyway = false;
+        if (isa<LoadInst>(I)) {
+            if (FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand()) !=
+                    FuncAnnotations.end() &&
+                (FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand())
+                     ->second.starts_with("to_duplicate") ||
+                 FuncAnnotations.find(cast<LoadInst>(I).getPointerOperand())
+                     ->second.starts_with("to_harden"))) {
+                shouldDuplicateAnyway = true;
+            } else if (I.getType()->isIntegerTy()) {
+                IRBuilder<> B(&I);
+                auto Idup = B.CreateAdd(&I, llvm::ConstantInt::get(I.getType(), 0));
+                cast<Instruction>(Idup)->moveAfter(&I);
+                DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(&I, Idup));
+                DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Idup, &I));
+            } else if (I.getType()->isFloatingPointTy()) {
+                IRBuilder<> B(&I);
+                auto Idup = B.CreateAdd(&I, llvm::ConstantFP::get(I.getType(), 0));
+                cast<Instruction>(Idup)->moveAfter(&I);
+                DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(&I, Idup));
+                DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Idup, &I));
+            }
+        } else if (isa<StoreInst>(I)) {
+            if (getDuplicateValue(cast<StoreInst>(I).getPointerOperand(), I.getFunction()) !=
+                nullptr) {
+                shouldDuplicateAnyway = true;
+            }
+        }
+        if (!shouldDuplicateAnyway) {
+            return 0;
+        }
+    } else if (isa<CallBase>(I) && cast<CallBase>(I).isInlineAsm()) {
+        return 0;
     }
 
-    else {
-      // duplicate the operands
-      duplicateOperands(I);
+    Instruction *clonedInst = nullptr;
+    int res = 0;
 
-      IRBuilder<> B(CInstr);
-      if (!isa<InvokeInst>(CInstr) && I.getNextNonDebugInstruction()) {
-        B.SetInsertPoint(I.getNextNonDebugInstruction());
-      } else if(isa<InvokeInst>(CInstr) && cast<InvokeInst>(CInstr)->getNormalDest()) {
-        B.SetInsertPoint(
-            &*cast<InvokeInst>(CInstr)->getNormalDest()->getFirstInsertionPt());
-      } else {
-        errs() << "Error: Can't set insert point! " << I << "\n";
-        abort();
-      }
-      // get the function with the duplicated signature, if it exists
-      Function *Fn = getFunctionDuplicate(CInstr->getCalledFunction());
-      // if the _dup function exists (and it is not itself the dup version) or is an indirect call, 
-      // we substitute the call instruction with a call to the function with duplicated arguments
-      if (CInstr->getCalledFunction() == NULL || (Fn != NULL && Fn != CInstr->getCalledFunction())) {
-        res = transformCallBaseInst(CInstr, B);
-      } else {
-        fixFuncValsPassedByReference(*CInstr, B);
-      }
+    // if the instruction is an alloca instruction we need to duplicate it
+    if (isa<AllocaInst>(I)) {
+
+        if (!isAllocaForExceptionHandling(cast<AllocaInst>(I))) {
+
+            clonedInst = cloneInstr(I);
+        };
+
     }
-  }
 
+    // if the instruction is a binary/unary instruction we need to duplicate it
+    // checking for its operands
+    else if (isa<BinaryOperator, UnaryInstruction, LoadInst, GetElementPtrInst, CmpInst, PHINode,
+                 SelectInst, InsertValueInst>(I)) {
+        // duplicate the instruction
+        clonedInst = cloneInstr(I);
 
-  if (clonedInst) {
-    auto SrcIt = deducedTypes.transparentTypes.find(&I);
-    if (SrcIt != deducedTypes.transparentTypes.end()) {
-      
-      std::vector<std::unique_ptr<tda::TransparentType>> ClonedTypes;
-      ClonedTypes.reserve(SrcIt->second.size());
-      for (auto &TyPtr : SrcIt->second) {
-        ClonedTypes.push_back(TyPtr->clone());
-      }
-
-      auto &DestSet = deducedTypes.transparentTypes[clonedInst];
-      for (auto &ClonedTy : ClonedTypes) {
-        DestSet.insert(std::move(ClonedTy));
-      }
+        // duplicate the operands
+        duplicateOperands(I);
     }
-  }
 
-  return res;
+    // if the instruction is a store instruction we need to duplicate it and its
+    // operands (if not duplicated already) and add consistency checks
+    else if (isa<StoreInst, AtomicRMWInst, AtomicCmpXchgInst>(I)) {
+        Instruction *IClone = cloneInstr(I);
+
+        // duplicate the operands
+        duplicateOperands(I);
+
+        // it may happen that I duplicate a store but don't change its operands, if
+        // that happens I just remove the duplicate
+        if (IClone->isIdenticalTo(&I)) {
+            IClone->eraseFromParent();
+
+            Value *Copy = getDuplicateValue(&I, I.getFunction());
+            if (Copy != nullptr) {
+                DuplicatedInstructionMap.erase(Copy);
+                DuplicatedInstructionMap.erase(&I);
+            }
+        }
+    }
+
+    // if the instruction is a branch/switch/return instruction, we need to
+    // duplicate its operands (if not duplicated already) and add consistency
+    // checks
+    else if (isa<BranchInst, SwitchInst, ReturnInst, IndirectBrInst>(I)) {
+        // duplicate the operands
+        duplicateOperands(I);
+    }
+
+    // if the istruction is a non-already-duplicated call, we duplicate the operands and add
+    // consistency checks
+    else if (isa<CallBase>(I) && DuplicatedCalls.find(&I) == DuplicatedCalls.end()) {
+        DuplicatedCalls.insert(&I);
+        CallBase *CInstr = cast<CallBase>(&I);
+        // there are some instructions that can be annotated with "to_duplicate" in
+        // order to tell the pass to duplicate the function call.
+        Function *Callee = CInstr->getCalledFunction();
+        Callee = getFunctionFromDuplicate(Callee);
+
+        if ((FuncAnnotations.find(Callee) != FuncAnnotations.end() &&
+             FuncAnnotations.find(Callee)->second.starts_with("exclude")) ||
+            (Callee != NULL && isToExclude(CInstr))) {
+            IRBuilder<> B(CInstr);
+            fixFuncValsPassedByReference(*CInstr, B);
+
+            return 0;
+        }
+
+        // check if the function call has to be duplicated
+        if ((FuncAnnotations.find(Callee) != FuncAnnotations.end() &&
+             FuncAnnotations.find(Callee)->second.starts_with("to_duplicate")) ||
+            (Callee != NULL && isToDuplicate(CInstr))) {
+            // duplicate the instruction
+            clonedInst = cloneInstr(*CInstr);
+
+            // duplicate the operands
+            duplicateOperands(I);
+
+            if (isa<InvokeInst>(I)) {
+                // In case of an invoke instruction, we have to fix the first invoke since
+                // it would jump to the next BB and not to the duplicated invoke instruction
+                auto *IInstr = &cast<InvokeInst>(I);
+                toFixInvokes.insert(IInstr);
+            }
+        }
+
+        else {
+            // duplicate the operands
+            duplicateOperands(I);
+
+            IRBuilder<> B(CInstr);
+            if (!isa<InvokeInst>(CInstr) && I.getNextNonDebugInstruction()) {
+                B.SetInsertPoint(I.getNextNonDebugInstruction());
+            } else if (isa<InvokeInst>(CInstr) && cast<InvokeInst>(CInstr)->getNormalDest()) {
+                B.SetInsertPoint(
+                    &*cast<InvokeInst>(CInstr)->getNormalDest()->getFirstInsertionPt());
+            } else {
+                errs() << "Error: Can't set insert point! " << I << "\n";
+                abort();
+            }
+            // get the function with the duplicated signature, if it exists
+            Function *Fn = getFunctionDuplicate(CInstr->getCalledFunction());
+            // if the _dup function exists (and it is not itself the dup version) or is an indirect
+            // call, we substitute the call instruction with a call to the function with duplicated
+            // arguments
+            if (CInstr->getCalledFunction() == NULL ||
+                (Fn != NULL && Fn != CInstr->getCalledFunction())) {
+                res = transformCallBaseInst(CInstr, B);
+            } else {
+                fixFuncValsPassedByReference(*CInstr, B);
+            }
+        }
+    }
+
+    if (clonedInst) {
+        auto SrcIt = deducedTypes.transparentTypes.find(&I);
+        if (SrcIt != deducedTypes.transparentTypes.end()) {
+
+            std::vector<std::unique_ptr<tda::TransparentType>> ClonedTypes;
+            ClonedTypes.reserve(SrcIt->second.size());
+            for (auto &TyPtr : SrcIt->second) {
+                ClonedTypes.push_back(TyPtr->clone());
+            }
+
+            auto &DestSet = deducedTypes.transparentTypes[clonedInst];
+            for (auto &ClonedTy : ClonedTypes) {
+                DestSet.insert(std::move(ClonedTy));
+            }
+        }
+    }
+
+    return res;
 }
 
 /**
@@ -1548,941 +1604,967 @@ int EDDI::duplicateInstruction(Instruction &I) {
  * either as a key or as value
  */
 bool EDDI::isValueDuplicated(Instruction &V) {
-  for (auto Elem : DuplicatedInstructionMap) {
-    if (Elem.first == &V || Elem.second == &V) {
-      return true;
+    for (auto Elem : DuplicatedInstructionMap) {
+        if (Elem.first == &V || Elem.second == &V) {
+            return true;
+        }
     }
-  }
-  return false;
+    return false;
 }
 
-Function *
-EDDI::duplicateFnArgs(Function &Fn, Module &Md) {
-  Type *RetType = Fn.getReturnType();
-  FunctionType *FnType = Fn.getFunctionType();
+Function *EDDI::duplicateFnArgs(Function &Fn, Module &Md) {
+    Type *RetType = Fn.getReturnType();
+    FunctionType *FnType = Fn.getFunctionType();
 
-  // create the param type lists
-  std::vector<Type *> paramTypeVec;
-  for (int i = 0; i < Fn.arg_size(); i++) {
-    Type *ParamType = FnType->params()[i];
+    // create the param type lists
+    std::vector<Type *> paramTypeVec;
+    for (int i = 0; i < Fn.arg_size(); i++) {
+        Type *ParamType = FnType->params()[i];
 
-    // Passing just one time the variadic arguments while passing two times the fixed ones
-    if(i >= FnType->getNumParams()) {
-      paramTypeVec.push_back(ParamType);
-    } else if (!AlternateMemMapEnabled) { // sequential
-      paramTypeVec.insert(paramTypeVec.begin() + i, ParamType);
-      paramTypeVec.push_back(ParamType);
-    } else {
-      paramTypeVec.push_back(ParamType);
-      paramTypeVec.push_back(ParamType); // two times
-    }
-  }
-
-  // update the function type adding the duplicated args
-  FunctionType *NewFnType = FnType->get(RetType,             // returntype
-                                        paramTypeVec,        // params
-                                        FnType->isVarArg()); // vararg
-
-  // create the function and clone the old one
-  Function *ClonedFunc = Fn.Create(NewFnType, Fn.getLinkage(),
-                                   Fn.getName() + "_dup", Fn.getParent());
-  ValueToValueMapTy Params;
-  for (int i = 0; i < Fn.arg_size(); i++) {
-    if (Fn.getArg(i)->hasStructRetAttr()) {
-      Fn.getArg(i)->removeAttr(Attribute::AttrKind::StructRet);
+        // Passing just one time the variadic arguments while passing two times the fixed ones
+        if (i >= FnType->getNumParams()) {
+            paramTypeVec.push_back(ParamType);
+        } else if (!AlternateMemMapEnabled) { // sequential
+            paramTypeVec.insert(paramTypeVec.begin() + i, ParamType);
+            paramTypeVec.push_back(ParamType);
+        } else {
+            paramTypeVec.push_back(ParamType);
+            paramTypeVec.push_back(ParamType); // two times
+        }
     }
 
-    if (!AlternateMemMapEnabled) {
-      Params[Fn.getArg(i)] = ClonedFunc->getArg(Fn.arg_size() + i);
-    } else {
-      Params[Fn.getArg(i)] = ClonedFunc->getArg(i * 2);
-    }
-  }
-  SmallVector<ReturnInst *, 8> returns;
-  CloneFunctionInto(ClonedFunc, &Fn, Params,
-                    CloneFunctionChangeType::GlobalChanges, returns);
+    // update the function type adding the duplicated args
+    FunctionType *NewFnType = FnType->get(RetType,             // returntype
+                                          paramTypeVec,        // params
+                                          FnType->isVarArg()); // vararg
 
-  return ClonedFunc;
+    // create the function and clone the old one
+    Function *ClonedFunc =
+        Fn.Create(NewFnType, Fn.getLinkage(), Fn.getName() + "_dup", Fn.getParent());
+    ValueToValueMapTy Params;
+    for (int i = 0; i < Fn.arg_size(); i++) {
+        if (Fn.getArg(i)->hasStructRetAttr()) {
+            Fn.getArg(i)->removeAttr(Attribute::AttrKind::StructRet);
+        }
+
+        if (!AlternateMemMapEnabled) {
+            Params[Fn.getArg(i)] = ClonedFunc->getArg(Fn.arg_size() + i);
+        } else {
+            Params[Fn.getArg(i)] = ClonedFunc->getArg(i * 2);
+        }
+    }
+    SmallVector<ReturnInst *, 8> returns;
+    CloneFunctionInto(ClonedFunc, &Fn, Params, CloneFunctionChangeType::GlobalChanges, returns);
+
+    return ClonedFunc;
 }
 
 /**
  * @brief Recursively searches for the value type, returning its type and alignment
  * @param Arg [In] Pointer to the value we want to analyze
- * @param ArgAlign [Out] The found alignment 
+ * @param ArgAlign [Out] The found alignment
  * @return The Type of Arg, if found. VoidTy otherwise
  */
 Type *getValueType(Value *Arg, Align *ArgAlign) {
-  // https://llvm.org/docs/OpaquePointers.html
-  while(true) {
-    if(isa<CallInst>(Arg) && !cast<CallInst>(Arg)->isIndirectCall() && demangle(cast<CallInst>(Arg)->getCalledFunction()->getName().str()).find("operator new") == 0) {
-      Value *Size = cast<CallInst>(Arg)->getArgOperand(0);
-      if(isa<ConstantInt>(Size)) {
-        // Use the size to create a type
-        LLVMContext &Ctx = Arg->getContext();
+    // https://llvm.org/docs/OpaquePointers.html
+    while (true) {
+        if (isa<CallInst>(Arg) && !cast<CallInst>(Arg)->isIndirectCall() &&
+            demangle(cast<CallInst>(Arg)->getCalledFunction()->getName().str())
+                    .find("operator new") == 0) {
+            Value *Size = cast<CallInst>(Arg)->getArgOperand(0);
+            if (isa<ConstantInt>(Size)) {
+                // Use the size to create a type
+                LLVMContext &Ctx = Arg->getContext();
 
-        // Assume the allocated memory is for an array of bytes
-        Type *ElementType = Type::getInt8Ty(Ctx); // Byte type
-        return ArrayType::get(ElementType, cast<ConstantInt>(Size)->getZExtValue());
-      }
-      errs() << "Error: Call not supported" << *Arg << "\n";
-      return Type::getVoidTy(Arg->getContext());
-    } else if(isa<GlobalValue>(Arg)) {
-      Type *ArgType = cast<GlobalValue>(Arg)->getValueType();
-      if(ArgType->isPointerTy()) {
-        bool foundNewValue = false;
-        for(Value *ArgUsers : cast<GlobalValue>(Arg)->users()) {
-          if (isa<StoreInst>(ArgUsers) && cast<StoreInst>(ArgUsers)->getPointerOperand() == Arg) {
-            Arg = cast<StoreInst>(ArgUsers)->getValueOperand();
-            *ArgAlign = cast<StoreInst>(ArgUsers)->getAlign();
-            foundNewValue = true;
-            break;
-          }
-        }
+                // Assume the allocated memory is for an array of bytes
+                Type *ElementType = Type::getInt8Ty(Ctx); // Byte type
+                return ArrayType::get(ElementType, cast<ConstantInt>(Size)->getZExtValue());
+            }
+            errs() << "Error: Call not supported" << *Arg << "\n";
+            return Type::getVoidTy(Arg->getContext());
+        } else if (isa<GlobalValue>(Arg)) {
+            Type *ArgType = cast<GlobalValue>(Arg)->getValueType();
+            if (ArgType->isPointerTy()) {
+                bool foundNewValue = false;
+                for (Value *ArgUsers : cast<GlobalValue>(Arg)->users()) {
+                    if (isa<StoreInst>(ArgUsers) &&
+                        cast<StoreInst>(ArgUsers)->getPointerOperand() == Arg) {
+                        Arg = cast<StoreInst>(ArgUsers)->getValueOperand();
+                        *ArgAlign = cast<StoreInst>(ArgUsers)->getAlign();
+                        foundNewValue = true;
+                        break;
+                    }
+                }
 
-        if(!foundNewValue) {
-          errs() << "Error: Global Type not supported" << *Arg << "\n";
-          return Type::getVoidTy(Arg->getContext());
+                if (!foundNewValue) {
+                    errs() << "Error: Global Type not supported" << *Arg << "\n";
+                    return Type::getVoidTy(Arg->getContext());
+                }
+            } else {
+                return ArgType;
+            }
+        } else if (isa<PHINode>(Arg)) {
+            Arg = cast<PHINode>(Arg)->getIncomingValue(0);
+        } else if (isa<AllocaInst>(Arg)) {
+            *ArgAlign = cast<AllocaInst>(Arg)->getAlign();
+            return cast<AllocaInst>(Arg)->getAllocatedType();
+        } else if (isa<GetElementPtrInst>(Arg)) {
+            *ArgAlign = cast<GetElementPtrInst>(Arg)->getPointerAlignment(
+                cast<GetElementPtrInst>(Arg)->getModule()->getDataLayout());
+            return cast<GetElementPtrInst>(Arg)->getSourceElementType();
+        } else if (isa<Function>(Arg)) {
+            return cast<Function>(Arg)->getFunctionType();
+        } else if (isa<LoadInst>(Arg)) {
+            *ArgAlign = cast<LoadInst>(Arg)->getAlign();
+            Arg = cast<LoadInst>(Arg)->getPointerOperand();
+        } else if (isa<StoreInst>(Arg)) {
+            *ArgAlign = cast<StoreInst>(Arg)->getAlign();
+            Arg = cast<StoreInst>(Arg)->getValueOperand();
+        } else {
+            errs() << "Error: Type not supported" << *Arg << "\n";
+            return Type::getVoidTy(Arg->getContext());
         }
-      } else {
-        return ArgType;
-      }
-    } else if(isa<PHINode>(Arg)) {
-      Arg = cast<PHINode>(Arg)->getIncomingValue(0);
-    } else if(isa<AllocaInst>(Arg)) {
-      *ArgAlign = cast<AllocaInst>(Arg)->getAlign();
-      return cast<AllocaInst>(Arg)->getAllocatedType();
-    } else if(isa<GetElementPtrInst>(Arg)) {
-      *ArgAlign = cast<GetElementPtrInst>(Arg)->getPointerAlignment(cast<GetElementPtrInst>(Arg)->getModule()->getDataLayout());
-      return cast<GetElementPtrInst>(Arg)->getSourceElementType();
-    } else if(isa<Function>(Arg)) {
-      return cast<Function>(Arg)->getFunctionType();
-    }  else if(isa<LoadInst>(Arg)) {
-      *ArgAlign = cast<LoadInst>(Arg)->getAlign();
-      Arg = cast<LoadInst>(Arg)->getPointerOperand();
-    } else if(isa<StoreInst>(Arg)) {
-      *ArgAlign = cast<StoreInst>(Arg)->getAlign();
-      Arg = cast<StoreInst>(Arg)->getValueOperand();
-    } else  {
-      errs() << "Error: Type not supported" << *Arg << "\n";
-      return Type::getVoidTy(Arg->getContext());
     }
-  }
 }
 
 /**
  * @brief I have to duplicate all instructions except function calls and branches
- * 
+ *
  * 0. Replacing aliases to aliasees
  * 1. getting function annotations
  * 2. Creating fault tolerance functions
  * 3. Create map of subprogram and linkage names
  * 4. Duplicate globals
- *    4.1. 
- * 5. For each function in module, if it should NOT compile (the function is neither null nor empty, 
- *    it does not have to be marked as excluded or to_duplicate nor it is one of the original functions) skip
- * 6. If the function is a duplicated one, we need to iterate over the function arguments and duplicate them in order to access them during the instruction duplication phase 
- *    6.1. Call duplicateInstruction on all uses of each argument
- * 7. For each Instruction, duplicate the instruction and then save for delete after if the duplicated instruction is the same as the original
+ *    4.1.
+ * 5. For each function in module, if it should NOT compile (the function is neither null nor empty,
+ *    it does not have to be marked as excluded or to_duplicate nor it is one of the original
+ * functions) skip
+ * 6. If the function is a duplicated one, we need to iterate over the function arguments and
+ * duplicate them in order to access them during the instruction duplication phase 6.1. Call
+ * duplicateInstruction on all uses of each argument
+ * 7. For each Instruction, duplicate the instruction and then save for delete after if the
+ * duplicated instruction is the same as the original
  * 8. Generate error branches
  * 9. Delete the marked duplicated instructions
- * 
- * 
+ *
+ *
  *
  * 1. Duplicate Globals
  * 2. Duplicate functions
  * 3. Duplicate Constructors
  *
- * 
+ *
  * @param Md
  * @return
  */
 PreservedAnalyses EDDI::run(Module &Md, ModuleAnalysisManager &AM) {
-  LLVM_DEBUG(dbgs() << "Initializing EDDI...\n");
+    LLVM_DEBUG(dbgs() << "Initializing EDDI...\n");
 
-  preprocess(Md);
-  LLVM_DEBUG(dbgs() << "[REDDI] Preprocess finished\n");
+    preprocess(Md);
+    LLVM_DEBUG(dbgs() << "[REDDI] Preprocess finished\n");
 
-  createFtFuncs(Md);
-  linkageMap = mapFunctionLinkageNames(Md);
+    createFtFuncs(Md);
+    linkageMap = mapFunctionLinkageNames(Md);
 
-  // fix debug information in the first BB of each function
-  if(DebugEnabled) {
-    for (auto &Fn : Md) {
-      // if the first instruction after the allocas does not have a debug location
-      if (shouldCompile(Fn, FuncAnnotations, OriginalFunctions) && !(*Fn.begin()).getFirstNonPHIOrDbgOrAlloca()->getDebugLoc()) {
-        auto I = &*(*Fn.begin()).getFirstNonPHIOrDbgOrAlloca();
-        auto NextI = I;
-        
-        // iterate over the next instructions finding the first debug loc
-        while (NextI = NextI->getNextNode()) {
-          if (NextI->getDebugLoc()) {
-            I->setDebugLoc(NextI->getDebugLoc());
-            break;
-          }
+    // fix debug information in the first BB of each function
+    if (DebugEnabled) {
+        for (auto &Fn : Md) {
+            // if the first instruction after the allocas does not have a debug location
+            if (shouldCompile(Fn, FuncAnnotations, OriginalFunctions) &&
+                !(*Fn.begin()).getFirstNonPHIOrDbgOrAlloca()->getDebugLoc()) {
+                auto I = &*(*Fn.begin()).getFirstNonPHIOrDbgOrAlloca();
+                auto NextI = I;
+
+                // iterate over the next instructions finding the first debug loc
+                while (NextI = NextI->getNextNode()) {
+                    if (NextI->getDebugLoc()) {
+                        I->setDebugLoc(NextI->getDebugLoc());
+                        break;
+                    }
+                }
+            }
         }
-      }
     }
-  }
 
-  LLVM_DEBUG(dbgs() << "Duplicating globals... ");
-  duplicateGlobals(Md);
-  LLVM_DEBUG(dbgs() << "[done]\n");
+    LLVM_DEBUG(dbgs() << "Duplicating globals... ");
+    duplicateGlobals(Md);
+    LLVM_DEBUG(dbgs() << "[done]\n");
 
-  // store the duplicated functions that are currently in the module
-  std::set<Function *> DuplicatedFns;
+    // store the duplicated functions that are currently in the module
+    std::set<Function *> DuplicatedFns;
 
 #ifdef DUPLICATE_ALL
-  // Insert in the set of "duplicated functions" the original "entrypoint" 
-  // function, to protect it "in place" and staring all the execution from 
-  // the Sphere of Replication.
-  if(Function *entryPointFn = Md.getFunction(entryPoint)) {
-    DuplicatedFns.insert(entryPointFn);
-  } else {
-    errs() << "[EDDI] Entry point function not found: " << entryPoint << "\n";
-    exit(1);
-  }
+    // Insert in the set of "duplicated functions" the original "entrypoint"
+    // function, to protect it "in place" and staring all the execution from
+    // the Sphere of Replication.
+    if (Function *entryPointFn = Md.getFunction(entryPoint)) {
+        DuplicatedFns.insert(entryPointFn);
+    }
 #endif
 
-  // then duplicate the function arguments using toHardenFunctions
-  LLVM_DEBUG(dbgs() << "Creating _dup functions\n");
-  for (Function *Fn : toHardenFunctions) {
-    // Create dup functions only if the function is declared in this module
-    // and isn't just to be duplicated
-    if(!Fn->isDeclaration() && !isToDuplicateName(Fn->getName())) {
-      Function *newFn = duplicateFnArgs(*Fn, Md);
-      DuplicatedFns.insert(newFn);
-    }
-  }
-  LLVM_DEBUG(dbgs() << "Creating _dup functions [done]\n");
-
-  // Fixing the duplicated constructors
-  fixDuplicatedConstructors(Md);
-
-  deducedTypes = tda.run(Md, AM);
-
-  // list of duplicated instructions to remove since they are equal to the original
-  std::set<CallBase *> GrayAreaCallsToFix;
-  ClonedInstructions.clear();
-  int iFn = 1;
-  LLVM_DEBUG(dbgs() << "Iterating over the functions...\n");
-
-  for (Function *Fn : DuplicatedFns) {
-    LLVM_DEBUG(dbgs() << "Compiling " << iFn++ << "/" << DuplicatedFns.size() << ": "
-                      << Fn->getName() << "\n");
-    CompiledFuncs.insert(Fn);
-
-    LLVM_DEBUG(dbgs() << "function arguments");
-    // save the function arguments and their duplicates
-    for (int i = 0; i < Fn->arg_size(); i++) {
-      Value *Arg, *ArgClone;
-      if (!AlternateMemMapEnabled) {
-        if (i >= Fn->arg_size() / 2) {
-          break;
+    // then duplicate the function arguments using toHardenFunctions
+    LLVM_DEBUG(dbgs() << "Creating _dup functions\n");
+    for (Function *Fn : toHardenFunctions) {
+        // Create dup functions only if the function is declared in this module
+        // and isn't just to be duplicated
+        if (!Fn->isDeclaration() && !isToDuplicateName(Fn->getName())) {
+            Function *newFn = duplicateFnArgs(*Fn, Md);
+            DuplicatedFns.insert(newFn);
         }
-        Arg = Fn->getArg(i);
-        ArgClone = Fn->getArg(i + Fn->arg_size() / 2);
-      } else {
-        if (i % 2 == 1)
-          continue;
-        Arg = Fn->getArg(i);
-        ArgClone = Fn->getArg(i + 1);
-      }
-      DuplicatedInstructionMap.insert(
-          std::pair<Value *, Value *>(Arg, ArgClone));
-      DuplicatedInstructionMap.insert(
-          std::pair<Value *, Value *>(ArgClone, Arg));
-      for (User *U : Arg->users()) {
-        if (isa<Instruction>(U)) {
-          Instruction *I = cast<Instruction>(U);
-          // duplicate the uses of each argument
-          if (duplicateInstruction(*I)) {
-            if(InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
-              InstructionsToRemove.insert(I);
+    }
+    LLVM_DEBUG(dbgs() << "Creating _dup functions [done]\n");
+
+    // Fixing the duplicated constructors
+    fixDuplicatedConstructors(Md);
+
+    deducedTypes = tda.run(Md, AM);
+
+    // list of duplicated instructions to remove since they are equal to the original
+    std::set<CallBase *> GrayAreaCallsToFix;
+    ClonedInstructions.clear();
+    int iFn = 1;
+    LLVM_DEBUG(dbgs() << "Iterating over the functions...\n");
+
+    for (Function *Fn : DuplicatedFns) {
+        LLVM_DEBUG(dbgs() << "Compiling " << iFn++ << "/" << DuplicatedFns.size() << ": "
+                          << Fn->getName() << "\n");
+        CompiledFuncs.insert(Fn);
+
+        LLVM_DEBUG(dbgs() << "function arguments");
+        // save the function arguments and their duplicates
+        for (int i = 0; i < Fn->arg_size(); i++) {
+            Value *Arg, *ArgClone;
+            if (!AlternateMemMapEnabled) {
+                if (i >= Fn->arg_size() / 2) {
+                    break;
+                }
+                Arg = Fn->getArg(i);
+                ArgClone = Fn->getArg(i + Fn->arg_size() / 2);
+            } else {
+                if (i % 2 == 1)
+                    continue;
+                Arg = Fn->getArg(i);
+                ArgClone = Fn->getArg(i + 1);
             }
-          }
-        }
-      }
-    }
-    LLVM_DEBUG(dbgs() << " [done]\n");
-
-    LLVM_DEBUG(dbgs() << "Duplicate instructions");
-
-    std::set<Instruction *> InstToDuplicate;
-    for (BasicBlock &BB : *Fn) {
-      for (Instruction &I : BB) {
-        InstToDuplicate.insert(&I);
-      }
-    }
-
-    for (Instruction *I : InstToDuplicate) {
-      if (!isValueDuplicated(*I)) {
-        // perform the duplication
-        int shouldDelete = duplicateInstruction(*I);
-
-        // the instruction duplicated may be equal to the original, so we
-        // return shouldDelete in order to drop the duplicates
-        if (shouldDelete) {
-          if(InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
-            InstructionsToRemove.insert(I);
-          }
-        }
-      }
-    }
-    
-    LLVM_DEBUG(dbgs() << " [done]\n");
-  }
-  
-  LLVM_DEBUG(dbgs() << "Iterating over variables...\n");
-  // Duplicate usages of global variables to harden only if not in a _dup function 
-  // (already handled in a duplicated function)
-  for (Value *V : toHardenVariables) {
-    if(V == NULL) {
-      errs() << "Error: To harden a null var\n";
-      continue;
-    }
-
-    for(User *U : V->users()) {
-      if(!isa<Instruction>(U)) {
-        // If User is not an instruction continue to next user
-        continue;
-      }
-
-      Instruction *I = cast<Instruction>(U);        
-      Function *Fn = I->getFunction();
-      
-      // Duplicate instruction only if this isn't an already duplicated function
-      if(!Fn->getName().ends_with("_dup")) {
-        if(!isa<CallBase>(I)) {
-          if(duplicateInstruction(*I)) {
-            if(InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
-              InstructionsToRemove.insert(I);
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Arg, ArgClone));
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(ArgClone, Arg));
+            for (User *U : Arg->users()) {
+                if (isa<Instruction>(U)) {
+                    Instruction *I = cast<Instruction>(U);
+                    // duplicate the uses of each argument
+                    if (duplicateInstruction(*I)) {
+                        if (InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
+                            InstructionsToRemove.insert(I);
+                        }
+                    }
+                }
             }
-          }
-        } else {
-          GrayAreaCallsToFix.insert(cast<CallBase>(I));
         }
-      }
-    }
-  }
-  
-  // Protect only the explicitly marked `to_harden` functions
-  LLVM_DEBUG(dbgs() << "Getting all GrayAreaCallsToFix...\n");
-  for(auto annot : FuncAnnotations) {
-    if(annot.second.starts_with("to_harden")) {
-      if(isa<Function>(annot.first)) {
-        auto Fn = cast<Function>(annot.first);
-        LLVM_DEBUG(dbgs() << "Adding to GrayAreaCallsToFix all calls of " << Fn->getName() << "\n");
-        // Get function calls in gray area
-        for(auto U : getFunctionFromDuplicate(Fn)->users()) {
-          if(isa<CallBase>(U)) {
-            auto caller = cast<CallBase>(U)->getFunction();
-            // Protect this call if it's not in toHardenFunction and is not marked as `exclude`
-            if(toHardenFunctions.find(caller) == toHardenFunctions.end() && 
-                  (FuncAnnotations.find(caller) == FuncAnnotations.end() || !FuncAnnotations.find(caller)->second.starts_with("exclude"))) {
-              LLVM_DEBUG(dbgs() << "GrayAreaCallsToFix added: " << *U << "\n");
-              GrayAreaCallsToFix.insert(cast<CallBase>(U));
+        LLVM_DEBUG(dbgs() << " [done]\n");
+
+        LLVM_DEBUG(dbgs() << "Duplicate instructions");
+
+        std::set<Instruction *> InstToDuplicate;
+        for (BasicBlock &BB : *Fn) {
+            for (Instruction &I : BB) {
+                InstToDuplicate.insert(&I);
             }
-          }
         }
-      }
-    }
-  }
-  
-  LLVM_DEBUG(dbgs() << "Fixing gray area calls\n");
-  // Add alloca and memcpy of non duplicated instructions and use that as duplciated instr
-  for(CallBase *CInstr : GrayAreaCallsToFix) {
-    if(FuncAnnotations.find(CInstr->getCalledFunction()) != FuncAnnotations.end() && 
-        FuncAnnotations.find(CInstr->getCalledFunction())->second.starts_with("exclude")) {
-      // Maybe check if have to fix operands and return after the call
-      errs() << "Error: About to duplicate a call not to duplciate: " << *CInstr << "\n";
-      continue;
-    }
 
+        for (Instruction *I : InstToDuplicate) {
+            if (!isValueDuplicated(*I)) {
+                // perform the duplication
+                int shouldDelete = duplicateInstruction(*I);
 
-    // Map with the duplicated instructions, including the temporary load ones
-    Function *Fn = CInstr->getFunction();
-
-    // Set insertion point for the load instructions
-    IRBuilder<> B(CInstr);
-    B.SetInsertPoint(CInstr);
-
-    for (unsigned i = 0; i < CInstr->arg_size(); i++) {
-      // Populate args and ParamTypes from the original instruction
-      Value *Arg = CInstr->getArgOperand(i);
-
-      // If argument has already a duplicate, nothing to do
-      if(getDuplicateValue(Arg, CInstr->getFunction()) != nullptr || !isa<Instruction>(Arg)) {
-        // If Argument already duplicated continue to next argument
-        continue;
-      }
-      
-      // Create alloca and memcpy only if ptr since if it is a value, we can just pass two times the same value
-      if(Arg->getType()->isPointerTy() && !CInstr->isByValArgument(i) && isa<Instruction>(Arg) && !isa<CallInst>(Arg))
-      {
-        // If cannot perform TAD, do not duplicate Arg
-        synchronizeFunctionArguments(Md, Arg, B, CInstr, true);
-      } else {
-        // Otherwise pass two times the same arg
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Arg, Arg)); // TODO: Check if needed
-      }
-    }
-
-    // Finally, duplicate the call
-    if(duplicateInstruction(*CInstr)) {
-      if(InstructionsToRemove.find(CInstr) == InstructionsToRemove.end()) {
-        InstructionsToRemove.insert(CInstr);
-      }
-    }
-  }
-
-  LLVM_DEBUG(dbgs() << "Fixing invokes\n");
-  for(InvokeInst *IInstr : toFixInvokes) {
-    if(IInstr == NULL) {
-      errs() << "Error: To fix a null invoke\n";
-      continue;
-    }
-
-    // Split every toFixInvoke in two different BBs, with the first having the normal continuation 
-    // to the next invoke and both having the same landingpad
-    auto *NewBB = IInstr->getParent()->splitBasicBlockBefore(IInstr->getNextNonDebugInstruction());
-    auto *BrI = NewBB->getTerminator();
-    BrI->removeFromParent();
-    BrI->deleteValue();
-
-    // Update the first invoke's normal destination
-    IInstr->setNormalDest(NewBB->getNextNode());
-  }
-
-  LLVM_DEBUG(dbgs() << "Remove instructions\n");
-  // Drop the instructions that have been marked for removal earlier
-  for (Instruction *I2rm : InstructionsToRemove) {
-    if(I2rm == NULL) {
-      errs() << "Error: To remove a null instruction\n";
-      continue;
-    }
-
-    I2rm->eraseFromParent();
-  }
-
-  // Add consistency checks and, if needed, transform in coarse-grained duplication
-  for(auto &Fn : Md) {
-    for(auto &BB : Fn) {
-      BasicBlock *ErrBB = BasicBlock::Create(Fn.getContext(), "ErrBB", &Fn);
-      for(auto &I : BB) {
-        Value *valueDup = getDuplicateValue(&I, &Fn);
-
-        if(!valueDup || !isa<Instruction>(valueDup) || cast<Instruction>(valueDup)->getParent() != &BB || I.comesBefore(cast<Instruction>(valueDup))) {
-          if(isa<CallBase>(I)) {
-            #ifdef CHECK_AT_CALLS
-            #if (SELECTIVE_CHECKING == 1)
-              if(I.getParent()->getTerminator() == NULL) {
-                errs() << "Malformed block!\n";
-                I.getParent()->print(errs());
-                errs() << "\n";
-              } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
-            #endif
-                addConsistencyChecks(I, *ErrBB);
-            #endif
-          } else if (isa<BranchInst, SwitchInst, ReturnInst, IndirectBrInst>(I)) {
-            #ifdef CHECK_AT_BRANCH
-              if(I.getParent()->getTerminator() == NULL) {
-                errs() << "Malformed block!\n";
-                I.getParent()->print(errs());
-                errs() << "\n";
-              } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
-                addConsistencyChecks(I, *ErrBB);
-            #endif
-          } else if (isa<StoreInst, AtomicRMWInst, AtomicCmpXchgInst>(I)) {
-            #ifdef CHECK_AT_STORES
-            #if (SELECTIVE_CHECKING == 1)
-              if(I.getParent()->getTerminator() == NULL) {
-                errs() << "Malformed block!\n";
-                I.getParent()->print(errs());
-                errs() << "\n";
-              } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
-            #endif
-                addConsistencyChecks(I, *ErrBB);
-            #endif
-          }
+                // the instruction duplicated may be equal to the original, so we
+                // return shouldDelete in order to drop the duplicates
+                if (shouldDelete) {
+                    if (InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
+                        InstructionsToRemove.insert(I);
+                    }
+                }
+            }
         }
-      }
-      // insert the code for calling the error basic block in case of a mismatch
-      CreateErrBB(Md, Fn, ErrBB);
 
-      if(CoarseGrainedDuplicationEnabled) {
-        repairBasicBlock(BB);
-      }
+        LLVM_DEBUG(dbgs() << " [done]\n");
     }
-  }
-  
 
-  LLVM_DEBUG(dbgs() << "Fixing global ctors\n");
-  fixGlobalCtors(Md);
-
-  // Fixing calls to default handlers
-  if(DebugEnabled){
-    LLVM_DEBUG(dbgs() << "Fixing DataCorruptionHandlers\n");
-    auto *DataCorruptionH = Md.getFunction(getLinkageName(linkageMap, "DataCorruption_Handler"));
-    for(User *U : DataCorruptionH->users()) {
-      if(isa<CallBase>(U)) {
-        if(auto *CallI = cast<CallBase>(U)) {
-          if(auto dbgLoc = findNearestDebugLoc(*CallI)) {
-            CallI->setDebugLoc(dbgLoc);
-          }
+    LLVM_DEBUG(dbgs() << "Iterating over variables...\n");
+    // Duplicate usages of global variables to harden only if not in a _dup function
+    // (already handled in a duplicated function)
+    for (Value *V : toHardenVariables) {
+        if (V == NULL) {
+            errs() << "Error: To harden a null var\n";
+            continue;
         }
-      }
+
+        for (User *U : V->users()) {
+            if (!isa<Instruction>(U)) {
+                // If User is not an instruction continue to next user
+                continue;
+            }
+
+            Instruction *I = cast<Instruction>(U);
+            Function *Fn = I->getFunction();
+
+            // Duplicate instruction only if this isn't an already duplicated function
+            if (!Fn->getName().ends_with("_dup")) {
+                if (!isa<CallBase>(I)) {
+                    if (duplicateInstruction(*I)) {
+                        if (InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
+                            InstructionsToRemove.insert(I);
+                        }
+                    }
+                } else {
+                    GrayAreaCallsToFix.insert(cast<CallBase>(I));
+                }
+            }
+        }
     }
-  }
 
-  LLVM_DEBUG(dbgs() << "Persisting Compiled Functions...\n");
-  persistCompiledFunctions(CompiledFuncs, "compiled_eddi_functions.csv");
-  
-  std::cout << "Comparison Counter: " << comparisonCounter << "\n";
+    // Protect only the explicitly marked `to_harden` functions
+    LLVM_DEBUG(dbgs() << "Getting all GrayAreaCallsToFix...\n");
+    for (auto annot : FuncAnnotations) {
+        if (annot.second.starts_with("to_harden")) {
+            if (isa<Function>(annot.first)) {
+                auto Fn = cast<Function>(annot.first);
+                LLVM_DEBUG(dbgs() << "Adding to GrayAreaCallsToFix all calls of " << Fn->getName()
+                                  << "\n");
+                // Get function calls in gray area
+                for (auto U : getFunctionFromDuplicate(Fn)->users()) {
+                    if (isa<CallBase>(U)) {
+                        auto caller = cast<CallBase>(U)->getFunction();
+                        // Protect this call if it's not in toHardenFunction and is not marked as
+                        // `exclude`
+                        if (toHardenFunctions.find(caller) == toHardenFunctions.end() &&
+                            (FuncAnnotations.find(caller) == FuncAnnotations.end() ||
+                             !FuncAnnotations.find(caller)->second.starts_with("exclude"))) {
+                            LLVM_DEBUG(dbgs() << "GrayAreaCallsToFix added: " << *U << "\n");
+                            GrayAreaCallsToFix.insert(cast<CallBase>(U));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-  return PreservedAnalyses::none();
+    LLVM_DEBUG(dbgs() << "Fixing gray area calls\n");
+    // Add alloca and memcpy of non duplicated instructions and use that as duplciated instr
+    for (CallBase *CInstr : GrayAreaCallsToFix) {
+        if (FuncAnnotations.find(CInstr->getCalledFunction()) != FuncAnnotations.end() &&
+            FuncAnnotations.find(CInstr->getCalledFunction())->second.starts_with("exclude")) {
+            // Maybe check if have to fix operands and return after the call
+            errs() << "Error: About to duplicate a call not to duplciate: " << *CInstr << "\n";
+            continue;
+        }
+
+        // Map with the duplicated instructions, including the temporary load ones
+        Function *Fn = CInstr->getFunction();
+
+        // Set insertion point for the load instructions
+        IRBuilder<> B(CInstr);
+        B.SetInsertPoint(CInstr);
+
+        for (unsigned i = 0; i < CInstr->arg_size(); i++) {
+            // Populate args and ParamTypes from the original instruction
+            Value *Arg = CInstr->getArgOperand(i);
+
+            // If argument has already a duplicate, nothing to do
+            if (getDuplicateValue(Arg, CInstr->getFunction()) != nullptr ||
+                !isa<Instruction>(Arg)) {
+                // If Argument already duplicated continue to next argument
+                continue;
+            }
+
+            // Create alloca and memcpy only if ptr since if it is a value, we can just pass two
+            // times the same value
+            if (Arg->getType()->isPointerTy() && !CInstr->isByValArgument(i) &&
+                isa<Instruction>(Arg) && !isa<CallInst>(Arg)) {
+                // If cannot perform TAD, do not duplicate Arg
+                synchronizeFunctionArguments(Md, Arg, B, CInstr, true);
+            } else {
+                // Otherwise pass two times the same arg
+                DuplicatedInstructionMap.insert(
+                    std::pair<Value *, Value *>(Arg, Arg)); // TODO: Check if needed
+            }
+        }
+
+        // Finally, duplicate the call
+        if (duplicateInstruction(*CInstr)) {
+            if (InstructionsToRemove.find(CInstr) == InstructionsToRemove.end()) {
+                InstructionsToRemove.insert(CInstr);
+            }
+        }
+    }
+
+    LLVM_DEBUG(dbgs() << "Fixing invokes\n");
+    for (InvokeInst *IInstr : toFixInvokes) {
+        if (IInstr == NULL) {
+            errs() << "Error: To fix a null invoke\n";
+            continue;
+        }
+
+        // Split every toFixInvoke in two different BBs, with the first having the normal
+        // continuation to the next invoke and both having the same landingpad
+        auto *NewBB =
+            IInstr->getParent()->splitBasicBlockBefore(IInstr->getNextNonDebugInstruction());
+        auto *BrI = NewBB->getTerminator();
+        BrI->removeFromParent();
+        BrI->deleteValue();
+
+        // Update the first invoke's normal destination
+        IInstr->setNormalDest(NewBB->getNextNode());
+    }
+
+    LLVM_DEBUG(dbgs() << "Remove instructions\n");
+    // Drop the instructions that have been marked for removal earlier
+    for (Instruction *I2rm : InstructionsToRemove) {
+        if (I2rm == NULL) {
+            errs() << "Error: To remove a null instruction\n";
+            continue;
+        }
+
+        I2rm->eraseFromParent();
+    }
+
+    // Add consistency checks and, if needed, transform in coarse-grained duplication
+    for (auto &Fn : Md) {
+        for (auto &BB : Fn) {
+            BasicBlock *ErrBB = BasicBlock::Create(Fn.getContext(), "ErrBB", &Fn);
+            for (auto &I : BB) {
+                Value *valueDup = getDuplicateValue(&I, &Fn);
+
+                if (!valueDup || !isa<Instruction>(valueDup) ||
+                    cast<Instruction>(valueDup)->getParent() != &BB ||
+                    I.comesBefore(cast<Instruction>(valueDup))) {
+                    if (isa<CallBase>(I)) {
+#ifdef CHECK_AT_CALLS
+#if (SELECTIVE_CHECKING == 1)
+                        if (I.getParent()->getTerminator() == NULL) {
+                            errs() << "Malformed block!\n";
+                            I.getParent()->print(errs());
+                            errs() << "\n";
+                        } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
+#endif
+                            addConsistencyChecks(I, *ErrBB);
+#endif
+                    } else if (isa<BranchInst, SwitchInst, ReturnInst, IndirectBrInst>(I)) {
+#ifdef CHECK_AT_BRANCH
+                        if (I.getParent()->getTerminator() == NULL) {
+                            errs() << "Malformed block!\n";
+                            I.getParent()->print(errs());
+                            errs() << "\n";
+                        } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
+                            addConsistencyChecks(I, *ErrBB);
+#endif
+                    } else if (isa<StoreInst, AtomicRMWInst, AtomicCmpXchgInst>(I)) {
+#ifdef CHECK_AT_STORES
+#if (SELECTIVE_CHECKING == 1)
+                        if (I.getParent()->getTerminator() == NULL) {
+                            errs() << "Malformed block!\n";
+                            I.getParent()->print(errs());
+                            errs() << "\n";
+                        } else if (I.getParent()->getTerminator()->getNumSuccessors() > 1)
+#endif
+                            addConsistencyChecks(I, *ErrBB);
+#endif
+                    }
+                }
+            }
+            // insert the code for calling the error basic block in case of a mismatch
+            CreateErrBB(Md, Fn, ErrBB);
+
+            if (CoarseGrainedDuplicationEnabled) {
+                repairBasicBlock(BB);
+            }
+        }
+    }
+
+    LLVM_DEBUG(dbgs() << "Fixing global ctors\n");
+    fixGlobalCtors(Md);
+
+    // Fixing calls to default handlers
+    if (DebugEnabled) {
+        LLVM_DEBUG(dbgs() << "Fixing DataCorruptionHandlers\n");
+        auto *DataCorruptionH =
+            Md.getFunction(getLinkageName(linkageMap, "DataCorruption_Handler"));
+        for (User *U : DataCorruptionH->users()) {
+            if (isa<CallBase>(U)) {
+                if (auto *CallI = cast<CallBase>(U)) {
+                    if (auto dbgLoc = findNearestDebugLoc(*CallI)) {
+                        CallI->setDebugLoc(dbgLoc);
+                    }
+                }
+            }
+        }
+    }
+
+    LLVM_DEBUG(dbgs() << "Persisting Compiled Functions...\n");
+    persistCompiledFunctions(CompiledFuncs, "compiled_eddi_functions.csv");
+
+    std::cout << "Comparison Counter: " << comparisonCounter << "\n";
+
+    return PreservedAnalyses::none();
 }
 
 bool EDDI::isHeapOriginatedThroughAlloca(llvm::AllocaInst *AI, unsigned depth) {
-  static constexpr unsigned MaxHeapOriginSearchDepth = 8;
-  if (depth > MaxHeapOriginSearchDepth)
-    return false;
+    static constexpr unsigned MaxHeapOriginSearchDepth = 8;
+    if (depth > MaxHeapOriginSearchDepth)
+        return false;
 
-  for (User *U : AI->users()) {
-    auto *SI = dyn_cast<StoreInst>(U);
-    if (SI && SI->getPointerOperand() == AI &&
-        isHeapOriginated(SI->getValueOperand(), depth + 1))
-      return true;
-  }
-  return false;
+    for (User *U : AI->users()) {
+        auto *SI = dyn_cast<StoreInst>(U);
+        if (SI && SI->getPointerOperand() == AI &&
+            isHeapOriginated(SI->getValueOperand(), depth + 1))
+            return true;
+    }
+    return false;
 }
 
 // Walks back through simple pointer-forwarding instructions to determine
 // whether `V` ultimately comes from a heap-allocation call (malloc/new/...).
 bool EDDI::isHeapOriginated(llvm::Value *V, unsigned depth) {
-  static constexpr unsigned MaxHeapOriginSearchDepth = 8; // guard against pathological/cyclic chains
-  errs() << "isHeapOriginated " << depth << ": " << *V << "\n";
-  if (depth > MaxHeapOriginSearchDepth) {
-    errs() << "MaxHeapOriginSearchDepth\n";
-    return false;
-  }
-
-  if (auto *CI = dyn_cast<CallInst>(V)) {
-    if (Function *callee = CI->getCalledFunction()) {
-      if(isHeapFunction(callee->getName())) {
-        errs() << "isHeapFunction!\n";
-        synchronizeHeapValue(V, cast<Instruction>(V), true);
-        return true;
-      }
+    static constexpr unsigned MaxHeapOriginSearchDepth =
+        8; // guard against pathological/cyclic chains
+    errs() << "isHeapOriginated " << depth << ": " << *V << "\n";
+    if (depth > MaxHeapOriginSearchDepth) {
+        errs() << "MaxHeapOriginSearchDepth\n";
+        return false;
     }
-    errs() << "isn't HeapFunction\n";
+
+    if (auto *CI = dyn_cast<CallInst>(V)) {
+        if (Function *callee = CI->getCalledFunction()) {
+            if (isHeapFunction(callee->getName())) {
+                errs() << "isHeapFunction!\n";
+                synchronizeHeapValue(V, cast<Instruction>(V), true);
+                return true;
+            }
+        }
+        errs() << "isn't HeapFunction\n";
+        return false;
+    }
+
+    if (auto *AI = dyn_cast<AllocaInst>(V))
+        return isHeapOriginatedThroughAlloca(AI, depth + 1);
+
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+        return isHeapOriginated(GEP->getPointerOperand(), depth + 1);
+
+    if (auto *LI = dyn_cast<LoadInst>(V))
+        return isHeapOriginated(LI->getPointerOperand(), depth + 1);
+
+    if (auto *PN = dyn_cast<PHINode>(V)) {
+        for (Value *incoming : PN->incoming_values())
+            if (isHeapOriginated(incoming, depth + 1)) {
+                errs() << "isHeapOriginated phi\n";
+                return true;
+            }
+    }
+
+    errs() << "false\n";
     return false;
-  }
-
-  if (auto *AI = dyn_cast<AllocaInst>(V))
-      return isHeapOriginatedThroughAlloca(AI, depth + 1);
-
-  if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
-    return isHeapOriginated(GEP->getPointerOperand(), depth + 1);
-
-  if (auto *LI = dyn_cast<LoadInst>(V))
-    return isHeapOriginated(LI->getPointerOperand(), depth + 1);
-
-  if (auto *PN = dyn_cast<PHINode>(V)) {
-    for (Value *incoming : PN->incoming_values())
-      if (isHeapOriginated(incoming, depth + 1)) {
-        errs() << "isHeapOriginated phi\n";
-        return true;
-      }
-  }
-
-  errs() << "false\n";
-  return false;
 }
 
 // Instead of TAD (alloca + memcpy snapshot), make sure the instruction that
 // produced this heap value has itself been duplicated, and reuse that real
 // duplicate as the synchronized value.
 bool EDDI::synchronizeHeapValue(llvm::Value *value, Instruction *I, bool before) {
-  Instruction *defInst = cast<Instruction>(value);
-  duplicateInstruction(*defInst);
+    Instruction *defInst = cast<Instruction>(value);
+    duplicateInstruction(*defInst);
 
-  std::set<Value *> toHardenHeapVariables{value};
-  std::set<Value *> toCheckVariables{toHardenHeapVariables};
-  while(!toCheckVariables.empty()) {
-    std::set<Value *> toAddVariables; // support set to contain new to-be-checked values
-    for(Value *V : toCheckVariables) {
-      // Just protect the return value of the call, not the operands
-      if((isa<Instruction>(V) || isa<GEPOperator>(V)) && !isa<CallBase>(V)) {
-        auto Instr = cast<User>(V);
+    std::set<Value *> toHardenHeapVariables{value};
+    std::set<Value *> toCheckVariables{toHardenHeapVariables};
+    while (!toCheckVariables.empty()) {
+        std::set<Value *> toAddVariables; // support set to contain new to-be-checked values
+        for (Value *V : toCheckVariables) {
+            // Just protect the return value of the call, not the operands
+            if ((isa<Instruction>(V) || isa<GEPOperator>(V)) && !isa<CallBase>(V)) {
+                auto Instr = cast<User>(V);
 
-        // Check parameters of function
-        for(int i = 0; i < Instr->getNumOperands(); i++) {
-          Value *operand = nullptr;
+                // Check parameters of function
+                for (int i = 0; i < Instr->getNumOperands(); i++) {
+                    Value *operand = nullptr;
 
-          // Get operand
-          if(isa<PHINode>(Instr)) {
-            auto PhiInst = cast<PHINode>(Instr);
-            operand = PhiInst->getIncomingValue(i);
-          } else if(isa<Instruction>(Instr->getOperand(i)) || isa<GlobalVariable>(Instr->getOperand(i)) || isa<GEPOperator>(Instr->getOperand(i))) {
-            operand = Instr->getOperand(i);
-          }
-          
-          // Check if to add operand to toAddVariables
-          if(operand != NULL && operand != V && isa<Instruction>(operand) &&
-                toHardenHeapVariables.find(operand) == toHardenHeapVariables.end() && 
-                toCheckVariables.find(operand) == toCheckVariables.end() && 
-                (FuncAnnotations.find(operand) == FuncAnnotations.end() || !FuncAnnotations.find(operand)->second.starts_with("exclude")) && 
-                (!operand->hasName() || !isToDuplicateName(operand->getName())) && 
-                (!isa<AllocaInst>(operand) || !isAllocaForExceptionHandling(*cast<AllocaInst>(operand)))) {
-            toAddVariables.insert(operand);
-          }
-        }
-      }
+                    // Get operand
+                    if (isa<PHINode>(Instr)) {
+                        auto PhiInst = cast<PHINode>(Instr);
+                        operand = PhiInst->getIncomingValue(i);
+                    } else if (isa<Instruction>(Instr->getOperand(i)) ||
+                               isa<GlobalVariable>(Instr->getOperand(i)) ||
+                               isa<GEPOperator>(Instr->getOperand(i))) {
+                        operand = Instr->getOperand(i);
+                    }
 
-      for(User *U : V->users()) {
-        if(isa<Instruction>(U) || isa<GEPOperator>(U)) {
-          if(U != NULL && U != V && 
-                toHardenHeapVariables.find(U) == toHardenHeapVariables.end() && 
-                toCheckVariables.find(U) == toCheckVariables.end() && 
-                (FuncAnnotations.find(U) == FuncAnnotations.end() || !FuncAnnotations.find(U)->second.starts_with("exclude")) && 
-                (!U->hasName() || !isToDuplicateName(U->getName())) && 
-                (!isa<AllocaInst>(U) || !isAllocaForExceptionHandling(*cast<AllocaInst>(U)))) {
-            // If it is a call, add also the called function in the toHardenFunction set
-            if(isa<CallBase>(U)) {
-              CallBase *CallI = cast<CallBase>(U);     
-              Function *Fn = CallI->getCalledFunction();  
-              if (Fn != NULL && getFunctionDuplicate(Fn) == NULL && 
-                    (FuncAnnotations.find(Fn) == FuncAnnotations.end() || 
-                      (!FuncAnnotations.find(Fn)->second.starts_with("exclude") && !FuncAnnotations.find(Fn)->second.starts_with("to_duplicate"))) && 
-                    !isToDuplicateName(Fn->getName()) && !Fn->getName().starts_with("__clang_call_terminate")) {
-                // If it isn't/hasn't a duplicate version already
-                // toHardenFunctions.insert(Fn);
-                toAddVariables.insert(U);
-              }
-            } else {
-              toAddVariables.insert(U);
+                    // Check if to add operand to toAddVariables
+                    if (operand != NULL && operand != V && isa<Instruction>(operand) &&
+                        toHardenHeapVariables.find(operand) == toHardenHeapVariables.end() &&
+                        toCheckVariables.find(operand) == toCheckVariables.end() &&
+                        (FuncAnnotations.find(operand) == FuncAnnotations.end() ||
+                         !FuncAnnotations.find(operand)->second.starts_with("exclude")) &&
+                        (!operand->hasName() || !isToDuplicateName(operand->getName())) &&
+                        (!isa<AllocaInst>(operand) ||
+                         !isAllocaForExceptionHandling(*cast<AllocaInst>(operand)))) {
+                        toAddVariables.insert(operand);
+                    }
+                }
             }
-          }
+
+            for (User *U : V->users()) {
+                if (isa<Instruction>(U) || isa<GEPOperator>(U)) {
+                    if (U != NULL && U != V &&
+                        toHardenHeapVariables.find(U) == toHardenHeapVariables.end() &&
+                        toCheckVariables.find(U) == toCheckVariables.end() &&
+                        (FuncAnnotations.find(U) == FuncAnnotations.end() ||
+                         !FuncAnnotations.find(U)->second.starts_with("exclude")) &&
+                        (!U->hasName() || !isToDuplicateName(U->getName())) &&
+                        (!isa<AllocaInst>(U) ||
+                         !isAllocaForExceptionHandling(*cast<AllocaInst>(U)))) {
+                        // If it is a call, add also the called function in the toHardenFunction set
+                        if (isa<CallBase>(U)) {
+                            CallBase *CallI = cast<CallBase>(U);
+                            Function *Fn = CallI->getCalledFunction();
+                            if (Fn != NULL && getFunctionDuplicate(Fn) == NULL &&
+                                (FuncAnnotations.find(Fn) == FuncAnnotations.end() ||
+                                 (!FuncAnnotations.find(Fn)->second.starts_with("exclude") &&
+                                  !FuncAnnotations.find(Fn)->second.starts_with("to_duplicate"))) &&
+                                !isToDuplicateName(Fn->getName()) &&
+                                !Fn->getName().starts_with("__clang_call_terminate")) {
+                                // If it isn't/hasn't a duplicate version already
+                                // toHardenFunctions.insert(Fn);
+                                toAddVariables.insert(U);
+                            }
+                        } else {
+                            toAddVariables.insert(U);
+                        }
+                    }
+                }
+            }
         }
-      }
+        toHardenHeapVariables.merge(toCheckVariables);
+        toCheckVariables = toAddVariables;
     }
-    toHardenHeapVariables.merge(toCheckVariables);
-    toCheckVariables = toAddVariables;
-  }
 
-  for(auto &V : toHardenHeapVariables) {
-    if(isa<Instruction>(V)) {
-      duplicateInstruction(*cast<Instruction>(V));
+    for (auto &V : toHardenHeapVariables) {
+        if (isa<Instruction>(V)) {
+            duplicateInstruction(*cast<Instruction>(V));
+        }
     }
-  }
 
-  return true;
+    return true;
 }
 
+bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilder<> &B,
+                                        Instruction *I, bool before) {
+    const llvm::DataLayout &DL = Md.getDataLayout();
 
-bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilder<> &B, Instruction *I, bool before) {
-  const llvm::DataLayout &DL = Md.getDataLayout();
+    if (isHeapOriginated(value)) {
+        errs() << *value << " isHeapOriginated\n";
+        return synchronizeHeapValue(value, I, before);
+    }
 
-  if (isHeapOriginated(value)) {
-    errs() << *value << " isHeapOriginated\n";
-    return synchronizeHeapValue(value, I, before);
-  }
-
-  tda::TransparentType *VTy = getBestType(value);
-  if (VTy == nullptr) {
-    return false;
-  }
-
-  // Cannot do argument duplication if the type contains opaque pointers since we cannot find the final value to duplicate
-  // Limitation: if the type found is a pointer to a struct containing opaque pointers, it could not appear as opaque pointer
-  {
-    auto VTyCopy = VTy;
-    while(VTyCopy->isPointerTT()) {
-      if (VTyCopy->isOpaquePtr()) {
-        errs() << "Warning! TAD value contains opaque pointer " << *value << "\n";
+    tda::TransparentType *VTy = getBestType(value);
+    if (VTy == nullptr) {
         return false;
-      }
-      VTyCopy = VTyCopy->getPointedType();
-    }
-  }
-
-  int indirections = 0;
-  Value *currentPtr = value;
-
-  // We need to find the final value pointed by the argument in order to duplicate it, 
-  // so we iterate over the pointer types until we find a non-pointer type
-  while (VTy->isPointerTT()) {
-    VTy = VTy->getPointedType();
-    if (!VTy) {
-      errs() << "Error! Can't find final value for pointer " << *currentPtr << "\n";
-      return false;
     }
 
-    if (VTy->isPointerTT()) {
-      indirections++;
-      currentPtr = B.CreateLoad(VTy->getLLVMType(), currentPtr);
+    // Cannot do argument duplication if the type contains opaque pointers since we cannot find the
+    // final value to duplicate Limitation: if the type found is a pointer to a struct containing
+    // opaque pointers, it could not appear as opaque pointer
+    {
+        auto VTyCopy = VTy;
+        while (VTyCopy->isPointerTT()) {
+            if (VTyCopy->isOpaquePtr()) {
+                errs() << "Warning! TAD value contains opaque pointer " << *value << "\n";
+                return false;
+            }
+            VTyCopy = VTyCopy->getPointedType();
+        }
     }
-  }
 
-  bool hasPerformedTAD = false;
-  Value *valueDup = getDuplicateValue(value, I->getFunction());
-  uint64_t SizeInBytes = 0;
-  if(isa<GetElementPtrInst>(currentPtr)) {
-    auto *gepInst = cast<GetElementPtrInst>(currentPtr);
-    SizeInBytes = DL.getTypeAllocSize(gepInst->getSourceElementType());
-  } else {
-    SizeInBytes = DL.getTypeAllocSize(VTy->getLLVMType());
-  }
+    int indirections = 0;
+    Value *currentPtr = value;
 
-  if(valueDup == nullptr) {
-    hasPerformedTAD = true;
-    assert(hasPerformedTAD && before && "TAD shall be performed only for syncrhonization before the instruction");
-    // currentPtr is now the pointer to the final value
+    // We need to find the final value pointed by the argument in order to duplicate it,
+    // so we iterate over the pointer types until we find a non-pointer type
+    while (VTy->isPointerTT()) {
+        VTy = VTy->getPointedType();
+        if (!VTy) {
+            errs() << "Error! Can't find final value for pointer " << *currentPtr << "\n";
+            return false;
+        }
 
-    AllocaInst *allocaPrev = nullptr;
+        if (VTy->isPointerTT()) {
+            indirections++;
+            currentPtr = B.CreateLoad(VTy->getLLVMType(), currentPtr);
+        }
+    }
 
-    if(isa<GetElementPtrInst>(currentPtr)) {
-      allocaPrev = B.CreateAlloca(VTy->getLLVMType(), ConstantInt::get(B.getInt8Ty(), SizeInBytes));
+    bool hasPerformedTAD = false;
+    Value *valueDup = getDuplicateValue(value, I->getFunction());
+    uint64_t SizeInBytes = 0;
+    if (isa<GetElementPtrInst>(currentPtr)) {
+        auto *gepInst = cast<GetElementPtrInst>(currentPtr);
+        SizeInBytes = DL.getTypeAllocSize(gepInst->getSourceElementType());
     } else {
-      allocaPrev = B.CreateAlloca(VTy->getLLVMType());
+        SizeInBytes = DL.getTypeAllocSize(VTy->getLLVMType());
     }
-    allocaPrev->moveAfter(allocaPrev->getParent()->getParent()->getEntryBlock().getFirstNonPHIOrDbgOrAlloca());
 
-    deducedTypes.transparentTypes[allocaPrev].insert(VTy->clone());
-    valueDup = allocaPrev;
-  } else {
-    hasPerformedTAD = false;
-  }
+    if (valueDup == nullptr) {
+        hasPerformedTAD = true;
+        assert(hasPerformedTAD && before &&
+               "TAD shall be performed only for syncrhonization before the instruction");
+        // currentPtr is now the pointer to the final value
 
-  Value *Size = llvm::ConstantInt::get(B.getInt8Ty(), SizeInBytes);
+        AllocaInst *allocaPrev = nullptr;
 
-  llvm::CallInst *memcpy_call = B.CreateMemCpy(
-      valueDup, valueDup->getPointerAlignment(DL),
-      currentPtr, valueDup->getPointerAlignment(DL),
-      Size);
-  if(!before) {
-    if(!I->isTerminator()) {
-      memcpy_call->moveAfter(I);
+        if (isa<GetElementPtrInst>(currentPtr)) {
+            allocaPrev =
+                B.CreateAlloca(VTy->getLLVMType(), ConstantInt::get(B.getInt8Ty(), SizeInBytes));
+        } else {
+            allocaPrev = B.CreateAlloca(VTy->getLLVMType());
+        }
+        allocaPrev->moveAfter(
+            allocaPrev->getParent()->getParent()->getEntryBlock().getFirstNonPHIOrDbgOrAlloca());
+
+        deducedTypes.transparentTypes[allocaPrev].insert(VTy->clone());
+        valueDup = allocaPrev;
     } else {
-      if(isa<InvokeInst>(I)) {
-        memcpy_call->moveBefore(cast<InvokeInst>(I)->getNormalDest()->getFirstNonPHIOrDbgOrAlloca());
-      } else {
-        errs() << "Error: not handled instruction for synchronize function arguments\n";
-        abort();
-      }
-    }
-  }
-  
-  auto VTyPtr = VTy->clone();
-
-  // Now we need to create as many allocas as the number of pointer indirections
-  // in order to duplicate the whole pointer chain
-  if(hasPerformedTAD) {
-    errs() << "TAD of " << *value << "  -in-  " << I->getFunction()->getName() << "\n";
-    for (int i = 0; i < indirections; ++i) {
-      VTyPtr = VTyPtr->getPointerToType();
-      auto *allocaCurr = B.CreateAlloca(VTyPtr->getLLVMType());
-      allocaCurr->moveAfter(allocaCurr->getParent()->getParent()->getEntryBlock().getFirstNonPHIOrDbgOrAlloca());
-      deducedTypes.transparentTypes[allocaCurr].insert(VTyPtr->getPointerToType()->clone());
-      B.CreateStore(valueDup, allocaCurr);
-      valueDup = allocaCurr;
+        hasPerformedTAD = false;
     }
 
-    DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(valueDup, value));
-    DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(value, valueDup));
-  }
+    Value *Size = llvm::ConstantInt::get(B.getInt8Ty(), SizeInBytes);
 
-  DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(memcpy_call, memcpy_call));
+    llvm::CallInst *memcpy_call =
+        B.CreateMemCpy(valueDup, valueDup->getPointerAlignment(DL), currentPtr,
+                       valueDup->getPointerAlignment(DL), Size);
+    if (!before) {
+        if (!I->isTerminator()) {
+            memcpy_call->moveAfter(I);
+        } else {
+            if (isa<InvokeInst>(I)) {
+                memcpy_call->moveBefore(
+                    cast<InvokeInst>(I)->getNormalDest()->getFirstNonPHIOrDbgOrAlloca());
+            } else {
+                errs() << "Error: not handled instruction for synchronize function arguments\n";
+                abort();
+            }
+        }
+    }
 
-  return true;
+    auto VTyPtr = VTy->clone();
+
+    // Now we need to create as many allocas as the number of pointer indirections
+    // in order to duplicate the whole pointer chain
+    if (hasPerformedTAD) {
+        errs() << "TAD of " << *value << "  -in-  " << I->getFunction()->getName() << "\n";
+        for (int i = 0; i < indirections; ++i) {
+            VTyPtr = VTyPtr->getPointerToType();
+            auto *allocaCurr = B.CreateAlloca(VTyPtr->getLLVMType());
+            allocaCurr->moveAfter(allocaCurr->getParent()
+                                      ->getParent()
+                                      ->getEntryBlock()
+                                      .getFirstNonPHIOrDbgOrAlloca());
+            deducedTypes.transparentTypes[allocaCurr].insert(VTyPtr->getPointerToType()->clone());
+            B.CreateStore(valueDup, allocaCurr);
+            valueDup = allocaCurr;
+        }
+
+        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(valueDup, value));
+        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(value, valueDup));
+    }
+
+    DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(memcpy_call, memcpy_call));
+
+    return true;
 }
 
 Instruction *getSingleReturnInst(Function &F) {
-  for (BasicBlock &BB : F) {
-    if (auto *retInst = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator())) {
-      return retInst;
+    for (BasicBlock &BB : F) {
+        if (auto *retInst = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator())) {
+            return retInst;
+        }
     }
-  }
-  return nullptr;
+    return nullptr;
 }
 
-void EDDI::CreateErrBB(Module &Md, Function &Fn, BasicBlock *ErrBB){
-  if(ErrBB->getNumUses() == 0) {
-    ErrBB->eraseFromParent();
-    return;
-  }
-
-  if(ErrBB->getTerminator()) {
-    // If the ErrBB already has a terminator, we assume it is correctly set up and we don't modify it
-    return;
-  }
-
-  IRBuilder<> ErrB(ErrBB);
-
-  assert(!getLinkageName(linkageMap, "DataCorruption_Handler").empty() &&
-          "Function DataCorruption_Handler is missing!");
-  auto CalleeF = ErrBB->getModule()->getOrInsertFunction(
-      getLinkageName(linkageMap, "DataCorruption_Handler"),
-      FunctionType::getVoidTy(Md.getContext()));
-
-  auto *CallI = ErrB.CreateCall(CalleeF);
-
-  if(MultipleErrBBEnabled) {
-    // Insert one error block for each consistency check so that a specific 
-    // recovery and continuation is possible
-
-    std::list<Instruction *> errBranches;
-    for (User *U : ErrBB->users()) {
-      Instruction *I = cast<Instruction>(U);
-      errBranches.push_back(I);
+void EDDI::CreateErrBB(Module &Md, Function &Fn, BasicBlock *ErrBB) {
+    if (ErrBB->getNumUses() == 0) {
+        ErrBB->eraseFromParent();
+        return;
     }
 
-    // For each consistency check branch to the ErrBB, we create a new 
-    // error block which jumps, at the end, to the normal continuation
-    for (Instruction *I : errBranches) {
-      ValueToValueMapTy VMap;
-      BasicBlock *ErrBBCopy = CloneBasicBlock(ErrBB, VMap);
-      ErrBBCopy->insertInto(ErrBB->getParent(), I->getParent());
-
-      BasicBlock *NormalContinuation = nullptr;
-      if (isa<BranchInst>(I)) {
-        BranchInst *BI = cast<BranchInst>(I);
-        if (BI->isConditional()) {
-          NormalContinuation = BI->getSuccessor(0) == ErrBB ?
-              BI->getSuccessor(1) : BI->getSuccessor(0);
-        }
-      } else if (isa<InvokeInst>(I)) {
-        InvokeInst *II = cast<InvokeInst>(I);
-        NormalContinuation = II->getNormalDest();
-      }
-
-      if (NormalContinuation) {
-        IRBuilder<> ErrBCopy(ErrBBCopy);
-        auto *BrInst = ErrBCopy.CreateBr(NormalContinuation);
-        if (DebugEnabled) {
-          BrInst->setDebugLoc(I->getDebugLoc());
-        }
-      } else {
-        errs() << "Error: consistency check without a normal continuation! " << *I << "\n";
-        IRBuilder<> ErrBCopy(ErrBBCopy);
-        ErrBCopy.CreateUnreachable();
-      }
-
-      I->replaceSuccessorWith(ErrBB, ErrBBCopy);
+    if (ErrBB->getTerminator()) {
+        // If the ErrBB already has a terminator, we assume it is correctly set up and we don't
+        // modify it
+        return;
     }
-    ErrBB->eraseFromParent();
 
-    if (DebugEnabled) {
-      for (Instruction *I : errBranches) {
-        auto *ErrBB = I->getSuccessor(1);
-        // set the debug location to the instruction the ErrBB is related to
-        for (Instruction &ErrI : *ErrBB) {
-          if (!I->getDebugLoc()) {
-            if(Fn.back().getTerminator()) {
-              if(auto DL = findNearestDebugLoc(*Fn.back().getTerminator())) {
-                ErrI.setDebugLoc(DL);
-              }
-            } else if(Fn.back().getPrevNode()->getTerminator()) {
-              // In some cases, the last block of the function may not have a terminator (e.g., an incomplete ErrBB),
-              // so we check the previous block's terminator as well
-              if(auto DL = findNearestDebugLoc(*Fn.back().getPrevNode()->getTerminator())) {
-                ErrI.setDebugLoc(DL);
-              }
+    IRBuilder<> ErrB(ErrBB);
+
+    assert(!getLinkageName(linkageMap, "DataCorruption_Handler").empty() &&
+           "Function DataCorruption_Handler is missing!");
+    auto CalleeF = ErrBB->getModule()->getOrInsertFunction(
+        getLinkageName(linkageMap, "DataCorruption_Handler"),
+        FunctionType::getVoidTy(Md.getContext()));
+
+    auto *CallI = ErrB.CreateCall(CalleeF);
+
+    if (MultipleErrBBEnabled) {
+        // Insert one error block for each consistency check so that a specific
+        // recovery and continuation is possible
+
+        std::list<Instruction *> errBranches;
+        for (User *U : ErrBB->users()) {
+            Instruction *I = cast<Instruction>(U);
+            errBranches.push_back(I);
+        }
+
+        // For each consistency check branch to the ErrBB, we create a new
+        // error block which jumps, at the end, to the normal continuation
+        for (Instruction *I : errBranches) {
+            ValueToValueMapTy VMap;
+            BasicBlock *ErrBBCopy = CloneBasicBlock(ErrBB, VMap);
+            ErrBBCopy->insertInto(ErrBB->getParent(), I->getParent());
+
+            BasicBlock *NormalContinuation = nullptr;
+            if (isa<BranchInst>(I)) {
+                BranchInst *BI = cast<BranchInst>(I);
+                if (BI->isConditional()) {
+                    NormalContinuation =
+                        BI->getSuccessor(0) == ErrBB ? BI->getSuccessor(1) : BI->getSuccessor(0);
+                }
+            } else if (isa<InvokeInst>(I)) {
+                InvokeInst *II = cast<InvokeInst>(I);
+                NormalContinuation = II->getNormalDest();
             }
-          } else {
-            ErrI.setDebugLoc(I->getDebugLoc());
-          }
-        }
-      }
-    }
-  } else {
-    // Leave just one error block for all consistency checks to minimize code size
-    ErrB.CreateUnreachable();
-    
-    if (DebugEnabled) {
-      for (Instruction &ErrI : *ErrBB) {
-        if(auto retInst = getSingleReturnInst(Fn)) {
-          auto DL = findNearestDebugLoc(*retInst);
-          if (!DL && Fn.back().getTerminator()) {
-            DL = findNearestDebugLoc(*Fn.back().getTerminator());
-          }
 
-          if(DL) {
-            ErrI.setDebugLoc(DL);
-          } else {
-            errs() << "Warning: no debug location found for error block in function " << Fn.getName() << "\n";
-          }
+            if (NormalContinuation) {
+                IRBuilder<> ErrBCopy(ErrBBCopy);
+                auto *BrInst = ErrBCopy.CreateBr(NormalContinuation);
+                if (DebugEnabled) {
+                    BrInst->setDebugLoc(I->getDebugLoc());
+                }
+            } else {
+                errs() << "Error: consistency check without a normal continuation! " << *I << "\n";
+                IRBuilder<> ErrBCopy(ErrBBCopy);
+                ErrBCopy.CreateUnreachable();
+            }
+
+            I->replaceSuccessorWith(ErrBB, ErrBBCopy);
         }
-      }
+        ErrBB->eraseFromParent();
+
+        if (DebugEnabled) {
+            for (Instruction *I : errBranches) {
+                auto *ErrBB = I->getSuccessor(1);
+                // set the debug location to the instruction the ErrBB is related to
+                for (Instruction &ErrI : *ErrBB) {
+                    if (!I->getDebugLoc()) {
+                        if (Fn.back().getTerminator()) {
+                            if (auto DL = findNearestDebugLoc(*Fn.back().getTerminator())) {
+                                ErrI.setDebugLoc(DL);
+                            }
+                        } else if (Fn.back().getPrevNode()->getTerminator()) {
+                            // In some cases, the last block of the function may not have a
+                            // terminator (e.g., an incomplete ErrBB), so we check the previous
+                            // block's terminator as well
+                            if (auto DL = findNearestDebugLoc(
+                                    *Fn.back().getPrevNode()->getTerminator())) {
+                                ErrI.setDebugLoc(DL);
+                            }
+                        }
+                    } else {
+                        ErrI.setDebugLoc(I->getDebugLoc());
+                    }
+                }
+            }
+        }
+    } else {
+        // Leave just one error block for all consistency checks to minimize code size
+        ErrB.CreateUnreachable();
+
+        if (DebugEnabled) {
+            for (Instruction &ErrI : *ErrBB) {
+                if (auto retInst = getSingleReturnInst(Fn)) {
+                    auto DL = findNearestDebugLoc(*retInst);
+                    if (!DL && Fn.back().getTerminator()) {
+                        DL = findNearestDebugLoc(*Fn.back().getTerminator());
+                    }
+
+                    if (DL) {
+                        ErrI.setDebugLoc(DL);
+                    } else {
+                        errs() << "Warning: no debug location found for error block in function "
+                               << Fn.getName() << "\n";
+                    }
+                }
+            }
+        }
     }
-  }
 }
 
 void EDDI::fixGlobalCtors(Module &M) {
-  LLVMContext &Context = M.getContext();
+    LLVMContext &Context = M.getContext();
 
-  // Retrieve the existing @llvm.global_ctors.
-  GlobalVariable *GlobalCtors = M.getGlobalVariable("llvm.global_ctors");
-  if (!GlobalCtors) {
-    return;
-  }
-
-  // Get the constantness and the section name of the existing global variable.
-  bool isConstant = GlobalCtors->isConstant();
-  StringRef Section = GlobalCtors->getSection();
-
-  // Get the type of the annotations array and struct.
-  ArrayType *CtorsArrayType = cast<ArrayType>(GlobalCtors->getValueType());
-  StructType *CtorStructType = cast<StructType>(CtorsArrayType->getElementType());
-
-  // Create the new Ctor struct fields.
-  PointerType *Int8PtrType = Type::getInt8Ty(Context)->getPointerTo();
-  Constant *IntegerConstant = ConstantInt::get(Type::getInt32Ty(Context), 65535);
-  Constant *NullPtr = ConstantPointerNull::get(Int8PtrType); // Null pointer for other fields.
-
-  // Retrieve existing annotations and append the new one.
-  std::vector<Constant *> Ctors;
-  if (ConstantArray *ExistingArray = dyn_cast<ConstantArray>(GlobalCtors->getInitializer())) {
-    for (unsigned i = 0; i < ExistingArray->getNumOperands(); ++i) {
-      auto *ctorStr = ExistingArray->getOperand(i);
-
-      auto *ctor = ctorStr->getOperand(1);
-      if(isa<Function>(ctor)){
-        Function *dupCtor = getFunctionDuplicate(cast<Function>(ctor));
-        // If there isn't the duplicated constructor, use the original one
-        if(dupCtor == NULL) {
-          dupCtor = cast<Function>(ctor);
-        }
-
-        Constant *CtorAsConstant = ConstantExpr::getBitCast(dupCtor, Int8PtrType);;
-        // Create the new Ctor struct.
-        Constant *NewCtor = ConstantStruct::get(
-            CtorStructType,
-            {IntegerConstant, CtorAsConstant, NullPtr});
-        Ctors.push_back(NewCtor);
-      }
+    // Retrieve the existing @llvm.global_ctors.
+    GlobalVariable *GlobalCtors = M.getGlobalVariable("llvm.global_ctors");
+    if (!GlobalCtors) {
+        return;
     }
-  }
 
-  // Create a new array with the correct type and size.
-  ArrayType *NewCtorArrayType = ArrayType::get(CtorStructType, Ctors.size());
-  Constant *NewCtorArray = ConstantArray::get(NewCtorArrayType, Ctors);
+    // Get the constantness and the section name of the existing global variable.
+    bool isConstant = GlobalCtors->isConstant();
+    StringRef Section = GlobalCtors->getSection();
 
-  // Remove the old global variable from the module's symbol table.
-  GlobalCtors->removeFromParent();
-  delete GlobalCtors;
+    // Get the type of the annotations array and struct.
+    ArrayType *CtorsArrayType = cast<ArrayType>(GlobalCtors->getValueType());
+    StructType *CtorStructType = cast<StructType>(CtorsArrayType->getElementType());
 
-  // Create a new global variable with the exact name "llvm.global_ctors".
-  GlobalVariable *NewGlobalCtors = new GlobalVariable(
-      M,
-      NewCtorArray->getType(),
-      isConstant,
-      GlobalValue::AppendingLinkage, // Must use appending linkage for @llvm.global_ctors.
-      NewCtorArray,
-      "llvm.global_ctors");
+    // Create the new Ctor struct fields.
+    PointerType *Int8PtrType = Type::getInt8Ty(Context)->getPointerTo();
+    Constant *IntegerConstant = ConstantInt::get(Type::getInt32Ty(Context), 65535);
+    Constant *NullPtr = ConstantPointerNull::get(Int8PtrType); // Null pointer for other fields.
 
-  // Set the section to match the original.
-  NewGlobalCtors->setSection(Section);
+    // Retrieve existing annotations and append the new one.
+    std::vector<Constant *> Ctors;
+    if (ConstantArray *ExistingArray = dyn_cast<ConstantArray>(GlobalCtors->getInitializer())) {
+        for (unsigned i = 0; i < ExistingArray->getNumOperands(); ++i) {
+            auto *ctorStr = ExistingArray->getOperand(i);
+
+            auto *ctor = ctorStr->getOperand(1);
+            if (isa<Function>(ctor)) {
+                Function *dupCtor = getFunctionDuplicate(cast<Function>(ctor));
+                // If there isn't the duplicated constructor, use the original one
+                if (dupCtor == NULL) {
+                    dupCtor = cast<Function>(ctor);
+                }
+
+                Constant *CtorAsConstant = ConstantExpr::getBitCast(dupCtor, Int8PtrType);
+                ;
+                // Create the new Ctor struct.
+                Constant *NewCtor =
+                    ConstantStruct::get(CtorStructType, {IntegerConstant, CtorAsConstant, NullPtr});
+                Ctors.push_back(NewCtor);
+            }
+        }
+    }
+
+    // Create a new array with the correct type and size.
+    ArrayType *NewCtorArrayType = ArrayType::get(CtorStructType, Ctors.size());
+    Constant *NewCtorArray = ConstantArray::get(NewCtorArrayType, Ctors);
+
+    // Remove the old global variable from the module's symbol table.
+    GlobalCtors->removeFromParent();
+    delete GlobalCtors;
+
+    // Create a new global variable with the exact name "llvm.global_ctors".
+    GlobalVariable *NewGlobalCtors = new GlobalVariable(
+        M, NewCtorArray->getType(), isConstant,
+        GlobalValue::AppendingLinkage, // Must use appending linkage for @llvm.global_ctors.
+        NewCtorArray, "llvm.global_ctors");
+
+    // Set the section to match the original.
+    NewGlobalCtors->setSection(Section);
 }
 
 /**
@@ -2505,103 +2587,94 @@ void EDDI::fixGlobalCtors(Module &M) {
  */
 void EDDI::repairBasicBlock(BasicBlock &BB) {
 
-  // Collect all duplicated instructions in this BB,
-  // preserving their relative order so that data-flow dependencies
-  // among duplicates remain satisfied after the move
-  std::vector<Instruction *> DupsInOrder;
+    // Collect all duplicated instructions in this BB,
+    // preserving their relative order so that data-flow dependencies
+    // among duplicates remain satisfied after the move
+    std::vector<Instruction *> DupsInOrder;
 
-  Instruction *InsertionPoint = BB.getFirstNonPHI();
-  for (Instruction &I : BB) {
-    // PHINodes must stay at the top of the block (LLVM invariant).
-    // AllocaInsts are kept in the entry block's alloca region.
-    // Terminators (br, ret, switch, …) must remain last.
-    // None of these should be relocated
+    Instruction *InsertionPoint = BB.getFirstNonPHI();
+    for (Instruction &I : BB) {
+        // PHINodes must stay at the top of the block (LLVM invariant).
+        // AllocaInsts are kept in the entry block's alloca region.
+        // Terminators (br, ret, switch, …) must remain last.
+        // None of these should be relocated
 
-    if (ClonedInstructions.find(&I) != ClonedInstructions.end()) {
-      // If this instruction belongs to the cloned set, it is a duplicate
-      // that needs to be sunk to the bottom of the block
-      DupsInOrder.push_back(&I);
-    } else if (I.isTerminator() || isa<CallBase>(I)) {
-      // If there are no duplicates in this block, nothing to reorder
-      if (DupsInOrder.empty()) {
-        continue;
-      }
+        if (ClonedInstructions.find(&I) != ClonedInstructions.end()) {
+            // If this instruction belongs to the cloned set, it is a duplicate
+            // that needs to be sunk to the bottom of the block
+            DupsInOrder.push_back(&I);
+        } else if (I.isTerminator() || isa<CallBase>(I)) {
+            // If there are no duplicates in this block, nothing to reorder
+            if (DupsInOrder.empty()) {
+                continue;
+            }
 
-      // Move every duplicate just before the terminator, in their
-      // original relative order
-      for (Instruction *Dup : DupsInOrder) {
-        if(isa<PHINode>(Dup)){
-          Dup->moveBefore(InsertionPoint);
+            // Move every duplicate just before the terminator, in their
+            // original relative order
+            for (Instruction *Dup : DupsInOrder) {
+                if (isa<PHINode>(Dup)) {
+                    Dup->moveBefore(InsertionPoint);
+                } else {
+                    Dup->moveBefore(&I);
+                }
+            }
+            DupsInOrder.clear();
+            InsertionPoint = I.getNextNode();
+            if (InsertionPoint == nullptr) {
+                return;
+            }
         }
-        else{
-          Dup->moveBefore(&I);
-        }
-      }
-      DupsInOrder.clear();
-      InsertionPoint = I.getNextNode();
-      if(InsertionPoint == nullptr) {
-        return;
-      }
-    }     
-  }
+    }
 }
-
 
 //-----------------------------------------------------------------------------
 // New PM Registration
 //-----------------------------------------------------------------------------
-static llvm::cl::opt<bool> MultipleErrBB(
-    "multiple-errbb",
-    llvm::cl::desc("Enable multiple error basic blocks in EDDI"),
-    llvm::cl::init(false));
+static llvm::cl::opt<bool>
+    MultipleErrBB("multiple-errbb", llvm::cl::desc("Enable multiple error basic blocks in EDDI"),
+                  llvm::cl::init(false));
 
-static llvm::cl::opt<bool> CoarseGrained(
-    "coarse-grained",
-    llvm::cl::desc("Enable coarse-grained duplication in EDDI"),
-    llvm::cl::init(false));
+static llvm::cl::opt<bool>
+    CoarseGrained("coarse-grained", llvm::cl::desc("Enable coarse-grained duplication in EDDI"),
+                  llvm::cl::init(false));
 
 llvm::PassPluginLibraryInfo getEDDIPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "eddi-verify", LLVM_VERSION_STRING,
-          [](PassBuilder &PB) {
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &FPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "func-ret-to-ref") {
-                    FPM.addPass(FuncRetToRef());
-                    return true;
-                  }
-                  return false;
+    return {LLVM_PLUGIN_API_VERSION, "eddi-verify", LLVM_VERSION_STRING, [](PassBuilder &PB) {
+                PB.registerPipelineParsingCallback([](StringRef Name, ModulePassManager &FPM,
+                                                      ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "func-ret-to-ref") {
+                        FPM.addPass(FuncRetToRef());
+                        return true;
+                    }
+                    return false;
                 });
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &FPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "eddi-verify") {
+                PB.registerPipelineParsingCallback([](StringRef Name, ModulePassManager &FPM,
+                                                      ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "eddi-verify") {
 #ifdef DUPLICATE_ALL
-                    FPM.addPass(EDDI(true, MultipleErrBB, CoarseGrained));
+                        FPM.addPass(EDDI(true, MultipleErrBB, CoarseGrained));
 #else
                     FPM.addPass(EDDI(false, MultipleErrBB, CoarseGrained));
 #endif
-                    return true;
-                  }
+                        return true;
+                    }
 
-                  return false;
+                    return false;
                 });
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &FPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "duplicate-globals") {
-                    FPM.addPass(DuplicateGlobals());
-                    return true;
-                  }
-                  return false;
+                PB.registerPipelineParsingCallback([](StringRef Name, ModulePassManager &FPM,
+                                                      ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "duplicate-globals") {
+                        FPM.addPass(DuplicateGlobals());
+                        return true;
+                    }
+                    return false;
                 });
-          }};
+            }};
 }
 
 // This is the core interface for pass plugins. It guarantees that 'opt' will
 // be able to recognize HelloWorld when added to the pass pipeline on the
 // command line, i.e. via '-passes=hello-world'
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
-llvmGetPassPluginInfo() {
-  return getEDDIPluginInfo();
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+    return getEDDIPluginInfo();
 }
