@@ -721,11 +721,11 @@ void EDDI::duplicateOperands(Instruction &I) {
                     for (auto &Idx : GEPOperand->indices()) {
                         indices.push_back(Idx);
                     }
-                    Constant *CloneGEPOperand =
-                        cast<ConstantExpr>(GEPOperand)
-                            ->getInBoundsGetElementPtr(GEPOperand->getSourceElementType(),
-                                                       cast<Constant>(ClonePtrOperand),
-                                                       ArrayRef<Value *>(indices));
+                    IRBuilder<> GEPBuilder(IClone);
+                    Value *CloneGEPOperand = GEPBuilder.CreateInBoundsGEP(
+                        GEPOperand->getSourceElementType(),
+                        ClonePtrOperand,
+                        ArrayRef<Value *>(indices));
                     IClone->setOperand(J, CloneGEPOperand);
                 }
             }
