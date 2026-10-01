@@ -84,6 +84,7 @@ Function* FuncRetToRef::updateFnSignature(Function &Fn, Module &Md) {
             continue;
         }
     }
+    ClonedFunc->removeRetAttr(Attribute::Range);
     
 
     ClonedFunc->setMemoryEffects(MemoryEffects::unknown());
