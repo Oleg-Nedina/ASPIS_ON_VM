@@ -843,29 +843,43 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
            "No pointers found");
 
     while (V1Ty->isPointerTT()) {
-        V1Ty = V1Ty->getPointedType();
-
-        if (V1Ty == nullptr) {
+        auto PointedTy = V1Ty->getPointedType();
+        if (PointedTy == nullptr) {
             errs() << "Warning1: Can't find final value for pointer " << V1 << "\n";
             return;
         }
-
+        Type *LLVMTy = PointedTy->getLLVMType();
+        if (!LLVMTy || !LLVMTy->isSized() || LLVMTy->isFunctionTy() || LLVMTy->isVoidTy()) {
+            break;
+        }
+        V1Ty = PointedTy;
         if (F1->getType()->isPointerTy()) {
-            F1 = B.CreateLoad(V1Ty->getLLVMType(), F1);
+            F1 = B.CreateLoad(LLVMTy, F1);
         }
     }
 
     while (V2Ty->isPointerTT()) {
-        V2Ty = V2Ty->getPointedType();
-
-        if (V2Ty == nullptr) {
+        auto PointedTy = V2Ty->getPointedType();
+        if (PointedTy == nullptr) {
             errs() << "Warning2: Can't find final value for pointer " << V2 << "\n";
             return;
         }
-
-        if (F2->getType()->isPointerTy()) {
-            F2 = B.CreateLoad(V2Ty->getLLVMType(), F2);
+        Type *LLVMTy = PointedTy->getLLVMType();
+        if (!LLVMTy || !LLVMTy->isSized() || LLVMTy->isFunctionTy() || LLVMTy->isVoidTy()) {
+            break;
         }
+        V2Ty = PointedTy;
+        if (F2->getType()->isPointerTy()) {
+            F2 = B.CreateLoad(LLVMTy, F2);
+        }
+    }
+
+    if (F1->getType()->isPointerTy() && F2->getType()->isPointerTy()) {
+        auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, F1, F2);
+        CmpInstructions->push_back(Cmp);
+        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
+        comparisonCounter++;
+        return;
     }
 
     if (F1->getType() != F2->getType()) {
