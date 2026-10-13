@@ -1253,10 +1253,7 @@ void EDDI::duplicateGlobals(Module &Md) {
         bool toExclude = !isa<Function>(GV) && GVAnnotation != FuncAnnotations.end() &&
                          GVAnnotation->second.starts_with("exclude");
 
-        if (! (isFunction || isConstant || isExtern || ends_withDup || isMetadataInfo || isReservedName || toExclude) // is not function, constant, struct and does not end with _dup
-        /* && ((hasInternalLinkage && (!isArray || (isArray && !cast<ArrayType>(GV.getValueType())->getArrayElementType()->isAggregateType() ))) // has internal linkage and is not an array, or is an array but the element type is not aggregate
-            || !isArray) */ // if it does not have internal linkage, it is not an array or a pointer
-        ) {
+        if (!(isFunction || isConstant || isStruct || isArray || isExtern || ends_withDup || isMetadataInfo || isReservedName || toExclude)) {
             Constant *Initializer = nullptr;
             if (GV->hasInitializer()) {
                 Initializer = GV->getInitializer();
@@ -1542,6 +1539,15 @@ int EDDI::duplicateInstruction(Instruction &I) {
              FuncAnnotations.find(Callee)->second.starts_with("exclude")) ||
             (Callee != NULL && isToExclude(CInstr))) {
             IRBuilder<> B(CInstr);
+            if (!isa<InvokeInst>(CInstr) && I.getNextNonDebugInstruction()) {
+                B.SetInsertPoint(I.getNextNonDebugInstruction());
+            } else if (isa<InvokeInst>(CInstr) && cast<InvokeInst>(CInstr)->getNormalDest()) {
+                B.SetInsertPoint(
+                    &*cast<InvokeInst>(CInstr)->getNormalDest()->getFirstInsertionPt());
+            } else {
+                errs() << "Error: Can't set insert point! " << I << "\n";
+                abort();
+            }
             fixFuncValsPassedByReference(*CInstr, B);
 
             return 0;
@@ -1581,11 +1587,7 @@ int EDDI::duplicateInstruction(Instruction &I) {
             }
             // get the function with the duplicated signature, if it exists
             Function *Fn = getFunctionDuplicate(CInstr->getCalledFunction());
-            // if the _dup function exists (and it is not itself the dup version) or is an indirect
-            // call, we substitute the call instruction with a call to the function with duplicated
-            // arguments
-            if (CInstr->getCalledFunction() == NULL ||
-                (Fn != NULL && Fn != CInstr->getCalledFunction())) {
+            if (Fn != NULL && Fn != CInstr->getCalledFunction()) {
                 res = transformCallBaseInst(CInstr, B);
             } else {
                 fixFuncValsPassedByReference(*CInstr, B);
@@ -2323,6 +2325,10 @@ bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilde
         SizeInBytes = DL.getTypeAllocSize(VTy->getLLVMType());
     }
 
+    if (SizeInBytes == 0) {
+        return false;
+    }
+
     if (valueDup == nullptr) {
         hasPerformedTAD = true;
         assert(hasPerformedTAD && before &&
@@ -2351,19 +2357,8 @@ bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilde
     llvm::CallInst *memcpy_call =
         B.CreateMemCpy(valueDup, valueDup->getPointerAlignment(DL), currentPtr,
                        valueDup->getPointerAlignment(DL), Size);
-    if (!before) {
-        if (!I->isTerminator()) {
-            memcpy_call->moveAfter(I);
-        } else {
-            if (isa<InvokeInst>(I)) {
-                memcpy_call->moveBefore(
-                    cast<InvokeInst>(I)->getNormalDest()->getFirstNonPHIOrDbgOrAlloca());
-            } else {
-                errs() << "Error: not handled instruction for synchronize function arguments\n";
-                abort();
-            }
-        }
-    }
+    // The caller is responsible for setting the correct insertion point in B
+    // when 'before' is false, so we don't need to move the memcpy manually.
 
     auto VTyPtr = VTy->clone();
 
