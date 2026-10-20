@@ -714,19 +714,33 @@ void EDDI::duplicateOperands(Instruction &I) {
                 GEPOperator *GEPOperand = cast<GEPOperator>(IClone->getOperand(J));
                 Value *PtrOperand = GEPOperand->getPointerOperand();
                 Value *ClonePtrOperand = getDuplicateValue(PtrOperand, I.getFunction());
-                // update the duplicate GEP operator using the duplicate of the pointer
-                // operand
                 if (ClonePtrOperand != nullptr) {
-                    std::vector<Value *> indices;
-                    for (auto &Idx : GEPOperand->indices()) {
-                        indices.push_back(Idx);
+                    if (auto *ConstPtr = dyn_cast<Constant>(ClonePtrOperand)) {
+                        std::vector<Constant *> constIndices;
+                        for (auto &Idx : GEPOperand->indices()) {
+                            constIndices.push_back(cast<Constant>(Idx.get()));
+                        }
+                        Constant *CloneGEPConst = ConstantExpr::getGetElementPtr(
+                            GEPOperand->getSourceElementType(),
+                            ConstPtr,
+                            ArrayRef<Constant *>(constIndices),
+                            GEPOperand->isInBounds());
+                        IClone->setOperand(J, CloneGEPConst);
+                    } else {
+                        std::vector<Value *> indices;
+                        for (auto &Idx : GEPOperand->indices()) {
+                            indices.push_back(Idx);
+                        }
+                        Instruction *InsertPt = isa<PHINode>(IClone)
+                            ? &*IClone->getParent()->getFirstInsertionPt()
+                            : IClone;
+                        IRBuilder<> GEPBuilder(InsertPt);
+                        Value *CloneGEPOperand = GEPBuilder.CreateInBoundsGEP(
+                            GEPOperand->getSourceElementType(),
+                            ClonePtrOperand,
+                            ArrayRef<Value *>(indices));
+                        IClone->setOperand(J, CloneGEPOperand);
                     }
-                    IRBuilder<> GEPBuilder(IClone);
-                    Value *CloneGEPOperand = GEPBuilder.CreateInBoundsGEP(
-                        GEPOperand->getSourceElementType(),
-                        ClonePtrOperand,
-                        ArrayRef<Value *>(indices));
-                    IClone->setOperand(J, CloneGEPOperand);
                 }
             }
         } else if (isa<Function>(V)) {
@@ -842,6 +856,7 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
             (V2Ty->isPointerTT() && V2.getType()->isPointerTy())) &&
            "No pointers found");
 
+    Type *LastPointedLLVMTy1 = nullptr;
     while (V1Ty->isPointerTT()) {
         auto PointedTy = V1Ty->getPointedType();
         if (PointedTy == nullptr) {
@@ -850,6 +865,7 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
         }
         Type *LLVMTy = PointedTy->getLLVMType();
         if (!LLVMTy || !LLVMTy->isSized() || LLVMTy->isFunctionTy() || LLVMTy->isVoidTy()) {
+            LastPointedLLVMTy1 = LLVMTy;
             break;
         }
         V1Ty = PointedTy;
@@ -858,6 +874,7 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
         }
     }
 
+    Type *LastPointedLLVMTy2 = nullptr;
     while (V2Ty->isPointerTT()) {
         auto PointedTy = V2Ty->getPointedType();
         if (PointedTy == nullptr) {
@@ -866,6 +883,7 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
         }
         Type *LLVMTy = PointedTy->getLLVMType();
         if (!LLVMTy || !LLVMTy->isSized() || LLVMTy->isFunctionTy() || LLVMTy->isVoidTy()) {
+            LastPointedLLVMTy2 = LLVMTy;
             break;
         }
         V2Ty = PointedTy;
@@ -875,10 +893,13 @@ void EDDI::comparePtrs(std::vector<Value *> *CmpInstructions, Value &V1, Value &
     }
 
     if (F1->getType()->isPointerTy() && F2->getType()->isPointerTy()) {
-        auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, F1, F2);
-        CmpInstructions->push_back(Cmp);
-        DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
-        comparisonCounter++;
+        if ((LastPointedLLVMTy1 && LastPointedLLVMTy1->isFunctionTy()) ||
+            (LastPointedLLVMTy2 && LastPointedLLVMTy2->isFunctionTy())) {
+            auto Cmp = B.CreateCmp(CmpInst::ICMP_EQ, F1, F2);
+            CmpInstructions->push_back(Cmp);
+            DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(Cmp, Cmp));
+            comparisonCounter++;
+        }
         return;
     }
 
@@ -1207,6 +1228,52 @@ Function *EDDI::getFunctionFromDuplicate(Function *Fn) {
     return FnDup;
 }
 
+static Constant *replaceGlobalInConstant(Constant *C, GlobalVariable *OldGV, GlobalVariable *NewGV) {
+    if (C == OldGV) {
+        return NewGV;
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+        std::vector<Constant *> Ops;
+        bool Changed = false;
+        for (unsigned i = 0; i < CE->getNumOperands(); ++i) {
+            Constant *Op = cast<Constant>(CE->getOperand(i));
+            Constant *NewOp = replaceGlobalInConstant(Op, OldGV, NewGV);
+            if (NewOp != Op) {
+                Changed = true;
+            }
+            Ops.push_back(NewOp);
+        }
+        return Changed ? CE->getWithOperands(Ops) : C;
+    }
+    if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+        std::vector<Constant *> Ops;
+        bool Changed = false;
+        for (unsigned i = 0; i < CS->getNumOperands(); ++i) {
+            Constant *Op = CS->getOperand(i);
+            Constant *NewOp = replaceGlobalInConstant(Op, OldGV, NewGV);
+            if (NewOp != Op) {
+                Changed = true;
+            }
+            Ops.push_back(NewOp);
+        }
+        return Changed ? ConstantStruct::get(CS->getType(), Ops) : C;
+    }
+    if (auto *CA = dyn_cast<ConstantArray>(C)) {
+        std::vector<Constant *> Ops;
+        bool Changed = false;
+        for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+            Constant *Op = CA->getOperand(i);
+            Constant *NewOp = replaceGlobalInConstant(Op, OldGV, NewGV);
+            if (NewOp != Op) {
+                Changed = true;
+            }
+            Ops.push_back(NewOp);
+        }
+        return Changed ? ConstantArray::get(CA->getType(), Ops) : C;
+    }
+    return C;
+}
+
 void EDDI::duplicateGlobals(Module &Md) {
     Value *RuntimeSig;
     Value *RetSig;
@@ -1216,6 +1283,7 @@ void EDDI::duplicateGlobals(Module &Md) {
             GVars.push_back(cast<GlobalVariable>(V));
         }
     }
+    std::vector<std::pair<GlobalVariable *, GlobalVariable *>> CreatedPairs;
     for (auto GV : GVars) {
         auto GVAnnotation = FuncAnnotations.find(GV);
 
@@ -1224,22 +1292,11 @@ void EDDI::duplicateGlobals(Module &Md) {
         }
 
         if (!isa<Function>(GV) && GVAnnotation != FuncAnnotations.end()) {
-            // What does these annotations do?
             if (GVAnnotation->second.starts_with("runtime_sig") ||
                 GVAnnotation->second.starts_with("run_adj_sig")) {
                 continue;
             }
         }
-        /**
-         * The global variable is duplicated if all the following hold:
-         * - It is not a function
-         * - It is not constant (i.e. read only)
-         * - It is not a struct
-         * - Doesn't end with "_dup" (i.e. has already been duplicated)
-         * - Has internal linkage and either:
-         *        a) It is not an array
-         *        b) It is an array but its elements are neither structs nor arrays
-         */
         bool isFunction = GV->getType()->isFunctionTy();
         bool isConstant = GV->isConstant();
         bool isStruct = GV->getValueType()->isStructTy();
@@ -1248,12 +1305,12 @@ void EDDI::duplicateGlobals(Module &Md) {
         bool ends_withDup = GV->getName().ends_with("_dup");
         bool isExtern = GV->hasExternalLinkage() && GV->isDeclaration();
         bool hasInternalLinkage = GV->hasInternalLinkage();
-        bool isMetadataInfo = GV->getSection() == "llvm.metadata";
+        bool hasCustomSection = GV->hasSection();
         bool isReservedName = GV->getName().starts_with("llvm.");
         bool toExclude = !isa<Function>(GV) && GVAnnotation != FuncAnnotations.end() &&
                          GVAnnotation->second.starts_with("exclude");
 
-        if (!(isFunction || isConstant || isStruct || isArray || isExtern || ends_withDup || isMetadataInfo || isReservedName || toExclude)) {
+        if (!(isFunction || isConstant || isExtern || ends_withDup || hasCustomSection || isReservedName || toExclude)) {
             Constant *Initializer = nullptr;
             if (GV->hasInitializer()) {
                 Initializer = GV->getInitializer();
@@ -1267,7 +1324,6 @@ void EDDI::duplicateGlobals(Module &Md) {
                 InsertBefore = GV;
             }
 
-            // get a copy of the global variable
             GlobalVariable *GVCopy =
                 new GlobalVariable(Md, GV->getValueType(), false, GV->getLinkage(), Initializer,
                                    GV->getName() + "_dup", InsertBefore, GV->getThreadLocalMode(),
@@ -1279,10 +1335,19 @@ void EDDI::duplicateGlobals(Module &Md) {
 
             GVCopy->setAlignment(GV->getAlign());
             GVCopy->setDSOLocal(GV->isDSOLocal());
-            // Save the duplicated global so that the duplicate can be used as operand
-            // of other duplicated instructions
             DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GV, GVCopy));
             DuplicatedInstructionMap.insert(std::pair<Value *, Value *>(GVCopy, GV));
+            CreatedPairs.push_back({GV, GVCopy});
+        }
+    }
+
+    for (auto &[OrigGV, CopyGV] : CreatedPairs) {
+        if (CopyGV->hasInitializer()) {
+            Constant *Init = CopyGV->getInitializer();
+            for (auto &[RefOrig, RefCopy] : CreatedPairs) {
+                Init = replaceGlobalInConstant(Init, RefOrig, RefCopy);
+            }
+            CopyGV->setInitializer(Init);
         }
     }
 }
@@ -2339,7 +2404,7 @@ bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilde
 
         if (isa<GetElementPtrInst>(currentPtr)) {
             allocaPrev =
-                B.CreateAlloca(VTy->getLLVMType(), ConstantInt::get(B.getInt8Ty(), SizeInBytes));
+                B.CreateAlloca(VTy->getLLVMType(), ConstantInt::get(B.getInt32Ty(), SizeInBytes));
         } else {
             allocaPrev = B.CreateAlloca(VTy->getLLVMType());
         }
@@ -2352,7 +2417,7 @@ bool EDDI::synchronizeFunctionArguments(Module &Md, llvm::Value *value, IRBuilde
         hasPerformedTAD = false;
     }
 
-    Value *Size = llvm::ConstantInt::get(B.getInt8Ty(), SizeInBytes);
+    Value *Size = llvm::ConstantInt::get(B.getInt32Ty(), SizeInBytes);
 
     llvm::CallInst *memcpy_call =
         B.CreateMemCpy(valueDup, valueDup->getPointerAlignment(DL), currentPtr,
