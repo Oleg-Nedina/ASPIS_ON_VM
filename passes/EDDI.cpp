@@ -743,17 +743,6 @@ void EDDI::duplicateOperands(Instruction &I) {
                     }
                 }
             }
-        } else if (isa<Function>(V)) {
-            // if the operand is a function we need to set the duplicate function as
-            // operand of the clone instruction
-            Function *FnOperand = cast<Function>(V);
-            auto DuplicateFn = getFunctionDuplicate(FnOperand);
-            if (DuplicateFn != NULL) {
-                I.setOperand(J, DuplicateFn);
-                if (IClone != nullptr) {
-                    IClone->setOperand(J, DuplicateFn);
-                }
-            }
         } else if (isa<StoreInst>(I) && isa<GlobalVariable>(V) &&
                    cast<GlobalVariable>(V)->isConstant()) {
             IRBuilder<> B(&I);
@@ -1989,7 +1978,8 @@ PreservedAnalyses EDDI::run(Module &Md, ModuleAnalysisManager &AM) {
             Function *Fn = I->getFunction();
 
             // Duplicate instruction only if this isn't an already duplicated function
-            if (!Fn->getName().ends_with("_dup")) {
+            if (!Fn->getName().ends_with("_dup") &&
+                shouldCompile(*Fn, FuncAnnotations, OriginalFunctions)) {
                 if (!isa<CallBase>(I)) {
                     if (duplicateInstruction(*I)) {
                         if (InstructionsToRemove.find(I) == InstructionsToRemove.end()) {
