@@ -262,12 +262,12 @@ bool isHeapFunction(StringRef FnMangledName) {
 
   auto FnName = demangle(FnMangledName.str());
 
-  if(FnName.find("malloc") != FnName.npos || 
-      FnName.find("free") != FnName.npos || 
+  if(FnName == "malloc" || 
+      FnName == "free" || 
       FnName.find("operator new") != FnName.npos || 
       FnName.find("operator delete") != FnName.npos || 
-      FnName.find("calloc") != FnName.npos || 
-      FnName.find("memset") != FnName.npos) {
+      FnName == "calloc" || 
+      FnName == "memset") {
     return true;
   }
 

@@ -45,6 +45,9 @@ Function* FuncRetToRef::updateFnSignature(Function &Fn, Module &Md) {
     if (RetType->isVoidTy()) {
         return NULL;
     }
+    if (Fn.isVarArg()) {
+        return NULL;
+    }
     FunctionType *FnType = Fn.getFunctionType();
     
     // create the param type list adding the return param type
