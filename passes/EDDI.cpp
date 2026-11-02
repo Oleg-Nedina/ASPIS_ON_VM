@@ -408,22 +408,27 @@ void EDDI::preprocess(Module &Md) {
         for (auto &BB : *Fn) {
             for (auto &I : BB) {
                 for (auto &V : I.operands()) {
-
                     if (isa<GlobalVariable>(V) && cast<GlobalVariable>(V)->hasInitializer() &&
                         toHardenVariables.find(V) == toHardenVariables.end()) {
-                        toHardenVariables.insert(V);
-                        LLVM_DEBUG(dbgs() << "Inserting GV from explicit toHarden: " << *V << "\n");
+                        if (FuncAnnotations.find(V) == FuncAnnotations.end() ||
+                            (!FuncAnnotations.find(V)->second.starts_with("exclude") &&
+                             !FuncAnnotations.find(V)->second.starts_with("to_duplicate"))) {
+                            toHardenVariables.insert(V);
+                            LLVM_DEBUG(dbgs() << "Inserting GV from explicit toHarden: " << *V << "\n");
+                        }
                     } else if (isa<GEPOperator>(V)) {
                         for (auto &U : cast<GEPOperator>(V)->operands()) {
-                            // if(isa<GlobalVariable>(U) && U->hasName() &&
-                            // !isToDuplicateName(U->getName())) {
                             if (isa<GlobalVariable>(U) &&
                                 cast<GlobalVariable>(U)->hasInitializer() &&
                                 toHardenVariables.find(U) == toHardenVariables.end()) {
-                                toHardenVariables.insert(U);
-                                LLVM_DEBUG(dbgs()
-                                           << "Inserting GV from explicit toHarden from GEPOp: "
-                                           << *U << "\n");
+                                if (FuncAnnotations.find(U) == FuncAnnotations.end() ||
+                                    (!FuncAnnotations.find(U)->second.starts_with("exclude") &&
+                                     !FuncAnnotations.find(U)->second.starts_with("to_duplicate"))) {
+                                    toHardenVariables.insert(U);
+                                    LLVM_DEBUG(dbgs()
+                                               << "Inserting GV from explicit toHarden from GEPOp: "
+                                               << *U << "\n");
+                                }
                             }
                         }
                     }
@@ -2100,6 +2105,9 @@ PreservedAnalyses EDDI::run(Module &Md, ModuleAnalysisManager &AM) {
 
     // Add consistency checks and, if needed, transform in coarse-grained duplication
     for (auto &Fn : Md) {
+        if (!Fn.isDeclaration()) {
+            Fn.addFnAttr(Attribute::NullPointerIsValid);
+        }
         for (auto &BB : Fn) {
             BasicBlock *ErrBB = BasicBlock::Create(Fn.getContext(), "ErrBB", &Fn);
             for (auto &I : BB) {
