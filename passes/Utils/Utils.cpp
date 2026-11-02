@@ -69,16 +69,14 @@ void getFuncAnnotations(Module &Md, std::map<Value*, StringRef> &FuncAnnotations
           // as first field, and the annotation as second field
           if (ConstantStruct *CS = dyn_cast<ConstantStruct>(CAOp)) {
             if (CS->getNumOperands() >= 2) {
-              if (isa<Function>(CS->getOperand(0)) || isa<GlobalValue>(CS->getOperand(0))) {
-                Value* AnnotatedFunction = CS->getOperand(0)/*->getOperand(0)*/;
-                // the second field is a pointer to a global constant Array that holds the string
+              Value *AnnotatedFunction = CS->getOperand(0)->stripPointerCasts();
+              if (isa<GlobalValue>(AnnotatedFunction)) {
                 if (GlobalVariable *GAnn =
-                        dyn_cast<GlobalVariable>(CS->getOperand(1)/*->getOperand(0)*/)) {
+                        dyn_cast<GlobalVariable>(CS->getOperand(1)->stripPointerCasts())) {
                   if (ConstantDataArray *A =
                           dyn_cast<ConstantDataArray>(GAnn->getOperand(0))) {
-                    // we have the annotation!
                     StringRef AS = A->getAsString();
-                    FuncAnnotations.insert(std::pair<Value*, StringRef>(AnnotatedFunction, AS)); // if the function is new, add it to the annotated functions
+                    FuncAnnotations.insert(std::pair<Value*, StringRef>(AnnotatedFunction, AS));
                   }
                 }
               }
