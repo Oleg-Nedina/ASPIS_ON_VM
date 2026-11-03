@@ -442,7 +442,10 @@ PreservedAnalyses RASM::run(Module &Md, ModuleAnalysisManager &AM) {
         assert(!getLinkageName(linkageMap,"SigMismatch_Handler").empty() && "Function SigMismatch_Handler is missing!");
         auto CalleeF = ErrBB->getModule()->getOrInsertFunction(
             getLinkageName(linkageMap,"SigMismatch_Handler"), FunctionType::getVoidTy(Md.getContext()));
-        ErrB.CreateCall(CalleeF)->setDebugLoc(debugLoc);
+        auto *CallI = ErrB.CreateCall(CalleeF);
+        CallI->setCallingConv(Md.getFunction(
+            getLinkageName(linkageMap, "SigMismatch_Handler"))->getCallingConv());
+        CallI->setDebugLoc(debugLoc);
         ErrB.CreateUnreachable();
 
         for (auto &Elem : RandomNumberBBs) {

@@ -177,10 +177,10 @@ void FuncRetToRef::updateFunctionCalls(Function &Fn, Function &NewFn) {
                     
                     // do the call
                     if (isa<CallInst>(CInstr)) {
-                        B.CreateCall(NewFn.getFunctionType(), &NewFn, args);
+                        B.CreateCall(NewFn.getFunctionType(), &NewFn, args)->setCallingConv(CInstr->getCallingConv());
                     } else if (isa<InvokeInst>(CInstr)) {
                         auto IInstr = cast<InvokeInst>(CInstr);
-                        B.CreateInvoke(NewFn.getFunctionType(), &NewFn, IInstr->getNormalDest(), IInstr->getUnwindDest(), args);
+                        B.CreateInvoke(NewFn.getFunctionType(), &NewFn, IInstr->getNormalDest(), IInstr->getUnwindDest(), args)->setCallingConv(CInstr->getCallingConv());
                         B.SetInsertPoint(&*(IInstr->getNormalDest()->getFirstInsertionPt()));
                     } else {
                         errs() << "ERROR - Unsupported call instruction:\n" << *CInstr << "\n";
@@ -202,10 +202,10 @@ void FuncRetToRef::updateFunctionCalls(Function &Fn, Function &NewFn) {
             args.push_back(TmpAlloca);
             // do the call
             if (isa<CallInst>(CInstr)) {
-                B.CreateCall(NewFn.getFunctionType(), &NewFn, args);
+                B.CreateCall(NewFn.getFunctionType(), &NewFn, args)->setCallingConv(CInstr->getCallingConv());
             } else if (isa<InvokeInst>(CInstr)) {
                 auto IInstr = cast<InvokeInst>(CInstr);
-                B.CreateInvoke(NewFn.getFunctionType(), &NewFn, IInstr->getNormalDest(), IInstr->getUnwindDest(), args);
+                B.CreateInvoke(NewFn.getFunctionType(), &NewFn, IInstr->getNormalDest(), IInstr->getUnwindDest(), args)->setCallingConv(CInstr->getCallingConv());
                 B.SetInsertPoint(&*(IInstr->getNormalDest()->getFirstInsertionPt()));
             } else {
                 errs() << "ERROR - Unsupported call instruction:\n" << *CInstr << "\n";

@@ -1299,7 +1299,7 @@ void EDDI::duplicateGlobals(Module &Md) {
         bool ends_withDup = GV->getName().ends_with("_dup");
         bool isExtern = GV->hasExternalLinkage() && GV->isDeclaration();
         bool hasInternalLinkage = GV->hasInternalLinkage();
-        bool hasCustomSection = GV->hasSection();
+        bool hasCustomSection = GV->getSection() == "llvm.metadata";
         bool isReservedName = GV->getName().starts_with("llvm.");
         bool toExclude = !isa<Function>(GV) && GVAnnotation != FuncAnnotations.end() &&
                          GVAnnotation->second.starts_with("exclude");
@@ -1477,6 +1477,7 @@ int EDDI::transformCallBaseInst(CallBase *CInstr, IRBuilder<> &B) {
     }
 
     if (NewCInstr) {
+        cast<CallBase>(NewCInstr)->setCallingConv(CInstr->getCallingConv());
         DuplicatedCalls.insert(NewCInstr);
     }
 
@@ -2480,6 +2481,8 @@ void EDDI::CreateErrBB(Module &Md, Function &Fn, BasicBlock *ErrBB) {
         FunctionType::getVoidTy(Md.getContext()));
 
     auto *CallI = ErrB.CreateCall(CalleeF);
+    CallI->setCallingConv(Md.getFunction(
+        getLinkageName(linkageMap, "DataCorruption_Handler"))->getCallingConv());
 
     if (MultipleErrBBEnabled) {
         // Insert one error block for each consistency check so that a specific

@@ -123,6 +123,7 @@ void DuplicateGlobals::duplicateCall(Module &Md, CallBase* UCall, Value* Origina
       // replace the original with the dup function
       IRBuilder<> B(UCall);
       auto *NewCall = B.CreateCall(Fn->getFunctionType(), Fn, args);
+      NewCall->setCallingConv(UCall->getCallingConv());
       UCall->replaceNonMetadataUsesWith(NewCall);
       UCall->eraseFromParent();
     }
